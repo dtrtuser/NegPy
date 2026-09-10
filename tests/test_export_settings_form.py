@@ -1,5 +1,7 @@
 """Round-trip tests for the shared ExportSettingsForm widget."""
 
+from PyQt6.QtWidgets import QApplication
+
 from negpy.desktop.view.widgets.export_settings_form import ExportSettingsForm
 from negpy.domain.models import (
     JXL_TAGGABLE_SPACES,
@@ -344,3 +346,27 @@ def test_presets_dialog_keeps_every_format_setting(qapp):
     assert preset.tiff_compression == TiffCompression.NONE
     assert preset.png_compress_level == 1
     assert preset.jpeg_progressive is True
+
+
+def test_load_does_not_reset_cursor_in_focused_filename_field(qapp):
+    """A periodic load() (from the debounced AppState resync) must not clobber the
+    caret position while the user is actively typing in the field — see issue #1071."""
+    from PyQt6.QtTest import QTest
+
+    form = ExportSettingsForm()
+    form.load(_values())
+    form.show()
+    QTest.qWaitForWindowActive(form)
+
+    form.filename_edit.setFocus()
+    QApplication.processEvents()
+    assert form.filename_edit.hasFocus()
+
+    form.filename_edit.setText("prefix_suffix")
+    form.filename_edit.setCursorPosition(6)  # caret sitting mid-string, between prefix_ and suffix
+
+    # Simulate the background resync that fires while the user is still typing.
+    form.load(_values(filename_pattern="prefix_suffix"))
+
+    assert form.filename_edit.cursorPosition() == 6
+    form.hide()

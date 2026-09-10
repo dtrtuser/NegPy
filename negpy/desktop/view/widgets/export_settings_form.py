@@ -676,6 +676,16 @@ class ExportSettingsForm(QWidget):
 
     # --- Load / read ---------------------------------------------------------
 
+    @staticmethod
+    def _set_text_preserving_edit(edit: QLineEdit, text: str) -> None:
+        """setText() unconditionally moves the caret to the end, so calling it while the
+        user is mid-edit (e.g. from a periodic AppState resync) yanks the cursor out from
+        under them. Skip the refresh for a focused field — its own textChanged handler is
+        what keeps AppState in sync with what's on screen anyway."""
+        if edit.hasFocus():
+            return
+        edit.setText(text)
+
     def load(self, v: Dict[str, Any]) -> None:
         """Populate all rows from a dict of shared field values."""
         self._loading = True
@@ -729,9 +739,9 @@ class ExportSettingsForm(QWidget):
             if idx >= 0:
                 self.output_mode_combo.setCurrentIndex(idx)
             self._update_output_mode_visibility(mode)
-            self.subfolder_edit.setText(v.get("output_subfolder", ""))
-            self.abspath_edit.setText(v.get("output_path", ""))
-            self.filename_edit.setText(v["filename_pattern"])
+            self._set_text_preserving_edit(self.subfolder_edit, v.get("output_subfolder", ""))
+            self._set_text_preserving_edit(self.abspath_edit, v.get("output_path", ""))
+            self._set_text_preserving_edit(self.filename_edit, v["filename_pattern"])
             self.overwrite_check.setChecked(v["overwrite"])
             self._apply_jxl_constraints()
             self._refresh_jxl_warning()

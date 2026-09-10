@@ -1597,7 +1597,10 @@ class ExportSidebar(BaseSidebar):
             self._cs_background_color = layout.background_color
             self._cs_label_color = layout.label_color
             self._update_cs_colors_btn_tooltip()
-            self.cs_output_path_edit.setText(conf.contact_sheet_output_path)
+            # setText() unconditionally moves the caret to the end; skip the refresh while the
+            # user is actively editing the field, same as ExportSettingsForm._set_text_preserving_edit.
+            if not self.cs_output_path_edit.hasFocus():
+                self.cs_output_path_edit.setText(conf.contact_sheet_output_path)
             self.sidecars_enabled_btn.setChecked(conf.export_sidecars_enabled)
             self.printing_notes_preview_btn.setChecked(self.state.printing_notes)
             self._refresh_contact_sheet_templates()
