@@ -170,6 +170,14 @@ class AssetDiscoveryTask:
     restore_stitches: dict | None = None  # {primary_path: {paths, transforms, canvas, sizes, hash}} (session restore).
     restore_hdr: dict | None = None  # {reference_path: {paths, ratios, align, hash}} (session restore).
     half_frame_profile: dict | None = None  # {crop_rect, split_x, gutter_thickness} override
+    half_frame_overrides: dict | None = None  # {base_hash: {crop_rect, split_x, gutter_thickness}} per-file overrides
+
+
+@dataclass(frozen=True)
+class AutoDetectAllSplitsTask:
+    """Request to re-find the gutter on every given scan, off the GUI thread."""
+
+    paths: list[str]
 
 
 @dataclass(frozen=True)
@@ -565,6 +573,7 @@ class AssetDiscoveryWorker(QObject):
     finished = pyqtSignal(list)
     error = pyqtSignal(str)
     rgb_grouped = pyqtSignal(dict)  # RGB-scan grouping outcome; the controller decides how loudly to say it
+    splits_detected = pyqtSignal(dict)  # {path: detected split_x}, for AutoDetectAllSplitsTask
 
     def _map_files(
         self,
@@ -594,6 +603,15 @@ class AssetDiscoveryWorker(QObject):
                 results[i] = fut.result()
                 self.progress.emit(done, total, label(paths[i]))
         return results
+
+    @pyqtSlot(AutoDetectAllSplitsTask)
+    def process_auto_detect_all_splits(self, task: AutoDetectAllSplitsTask) -> None:
+        import os
+
+        from negpy.services.assets.half_frame import detect_split_x_for_file
+
+        detected = self._map_files(task.paths, detect_split_x_for_file, lambda p: f"Split {os.path.basename(p)}", _DECODE_WORKERS)
+        self.splits_detected.emit(dict(zip(task.paths, detected)))
 
     @pyqtSlot(AssetDiscoveryTask)
     def process(self, task: AssetDiscoveryTask) -> None:
@@ -656,28 +674,36 @@ class AssetDiscoveryWorker(QObject):
             valid_assets = self._attach_restored_hdr(valid_assets, task.restore_hdr)
 
         if task.half_frame and valid_assets:
-            valid_assets = self._expand_half_frames(valid_assets, profile=task.half_frame_profile)
+            valid_assets = self._expand_half_frames(valid_assets, profile=task.half_frame_profile, overrides=task.half_frame_overrides)
 
         self.finished.emit(valid_assets)
 
-    def _expand_half_frames(self, assets: list, profile: dict | None = None) -> list:
+    def _expand_half_frames(self, assets: list, profile: dict | None = None, overrides: dict | None = None) -> list:
         """Expand each file into two half-frame assets sharing the path, with
         per-half hash/name identities. Composite assets (triplet, stitch, HDR) stay
         whole — an unsupported combination.
 
-        When ``profile`` is set (a {crop_rect, split_x, gutter_thickness} dict saved
-        from the half-frame rectangle editor), it overrides the auto-detected split
-        and adds the crop rect + gutter to every expanded half.
+        Per-file resolution, highest priority first:
+          1. ``overrides[base_hash]`` — a {crop_rect, split_x, gutter_thickness} dict
+             saved for this one file from the rectangle editor's per-frame mode, for
+             the odd frame the roll-wide setting still gets wrong.
+          2. ``profile`` (a {crop_rect, split_x, gutter_thickness} dict saved from
+             the editor) — shared across the roll, for every file without its own
+             override.
+          3. No profile yet — every file auto-detects, so a first-time roll starts
+             from a real split rather than a blind center cut.
         """
         import os
 
-        from negpy.services.assets.half_frame import detect_split_x_for_file, half_hash, half_name, is_composite
+        from negpy.services.assets.half_frame import base_hash, detect_split_x_for_file, half_hash, half_name, is_composite
 
         def _splittable(a: dict) -> bool:
             return not is_composite(a)
 
-        if profile is None:
-            paths = [a["path"] for a in assets if _splittable(a)]
+        overrides = overrides or {}
+        auto_split = profile is None
+        if auto_split:
+            paths = [a["path"] for a in assets if _splittable(a) and base_hash(a["hash"]) not in overrides]
             detected = self._map_files(paths, detect_split_x_for_file, lambda p: f"Split {os.path.basename(p)}", _DECODE_WORKERS)
             splits = dict(zip(paths, detected))
         else:
@@ -688,11 +714,16 @@ class AssetDiscoveryWorker(QObject):
             if not _splittable(a):
                 out.append(a)
                 continue
-            if profile is not None:
-                split_x = float(profile.get("split_x") or 0.5)
-            else:
+            override = overrides.get(base_hash(a["hash"]))
+            if override is not None:
+                split_x = float(override.get("split_x") or 0.5)
+            elif auto_split:
+                # 0.5 is detect_split_x's own "nothing found" sentinel; auto_split is
+                # only true with no profile, so there is no tuned value to fall back to.
                 detected_x = splits.get(a["path"])
-                split_x = 0.5 if detected_x is None else float(detected_x)
+                split_x = float(detected_x) if detected_x is not None else 0.5
+            else:
+                split_x = float(profile.get("split_x") or 0.5)
             legacy = a.get("legacy_hash")
             for half in (1, 2):
                 entry = {
@@ -703,11 +734,12 @@ class AssetDiscoveryWorker(QObject):
                     "half": half,
                     "split_x": split_x,
                 }
-                if profile is not None:
-                    cr = profile.get("crop_rect")
+                source = override if override is not None else profile
+                if source is not None:
+                    cr = source.get("crop_rect")
                     if cr is not None:
                         entry["crop_rect"] = tuple(cr)
-                    entry["gutter_thickness"] = float(profile.get("gutter_thickness") or 0.0)
+                    entry["gutter_thickness"] = float(source.get("gutter_thickness") or 0.0)
                 out.append(entry)
         return out
 

@@ -624,6 +624,7 @@ class ImageProcessor:
         skip_flatfield: bool = False,
         cam_xyz: Optional[list] = None,
         camera_wb: Optional[list] = None,
+        cache_stages: bool = True,
     ) -> Tuple[Any, Dict[str, Any]]:
         """
         Executes rendering pipeline. Returns result (ndarray/GPUTexture) and metrics.
@@ -715,6 +716,7 @@ class ImageProcessor:
             wants_uv_grid=wants_uv_grid,
             cam_xyz=cam_xyz,
             camera_wb=camera_wb,
+            cache_stages=cache_stages,
         )
         if metrics:
             context.metrics.update(metrics)
@@ -744,10 +746,7 @@ class ImageProcessor:
             hair_masks,
         )
 
-        if self._is_flat(settings) or crop_preview_full:
-            # The crop tool's "show full uncropped frame" preview needs one CPU render per
-            # settings change, since dragging only moves an overlay rect. Sidestep the GPU
-            # engine's ROI-fused compute dispatch here.
+        if self._is_flat(settings):
             prefer_gpu = False
 
         if prefer_gpu and self.engine_gpu:
@@ -762,6 +761,7 @@ class ImageProcessor:
                     analysis_source_hash=source_hash,
                     cam_xyz=cam_xyz,
                     camera_wb=camera_wb,
+                    full_frame=crop_preview_full,
                 )
                 context.metrics.update(gpu_metrics)
                 return processed, context.metrics
@@ -1228,6 +1228,7 @@ class ImageProcessor:
                 metrics=metrics or {"log_bounds": bounds_override} if bounds_override else metrics,
                 prefer_gpu=False,
                 wants_uv_grid=False,
+                cache_stages=False,
                 skip_flatfield=True,  # f32_buffer already flat-fielded by _load_source_f32
                 cam_xyz=cam_xyz,
                 camera_wb=camera_wb,

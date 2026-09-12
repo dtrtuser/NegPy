@@ -27,6 +27,7 @@ from negpy.desktop.workers.export import ExportTask, ExportWorker, LinearOutputT
 from negpy.desktop.workers.render import (
     AssetDiscoveryTask,
     AssetDiscoveryWorker,
+    AutoDetectAllSplitsTask,
     rgb_grouping_notice,
     rgb_nothing_matched_message,
     BatchAutoCropInput,
@@ -49,8 +50,8 @@ from negpy.desktop.workers.library import LibrarySearchTask, LibrarySearchWorker
 from negpy.desktop.workers.hdr import HdrTask, HdrWorker
 from negpy.desktop.workers.stitch import StitchTask, StitchWorker
 from negpy.features.hdr.models import ANCHOR_EV_UNSET, hdr_frame_paths, hdr_hash, hdr_name
-from negpy.features.process.capture_color import apply_camera_matrix, camera_to_working_matrix, wb_only_cam_xyz
-from negpy.features.process.logic import effective_linear_raw, narrowband_profile_active, should_fold_camera_wb
+from negpy.features.process.capture_color import apply_camera_matrix, camera_to_working_matrix, lightbox_level, wb_only_cam_xyz
+from negpy.features.process.logic import effective_linear_raw, narrowband_profile_active
 from negpy.features.stitch.models import stitch_hash, stitch_name
 from negpy.desktop.workers.capture_worker import (
     CalibrationRequest,
@@ -77,12 +78,14 @@ from negpy.domain.models import (
 )
 from negpy.services.assets.composites import forget_composite, restore_maps
 from negpy.services.assets.half_frame import (
+    HalfGeometry,
     base_hash,
     diptych_configs,
     forget_split_scan,
     half_hash,
     half_of,
     is_composite,
+    remap_workspace_config,
     remember_split_scans,
     split_scans,
 )
@@ -242,6 +245,7 @@ class _DiscoveryRequest:
     rgb_scan: bool
     half_frame: bool
     half_frame_profile: Optional[dict] = None  # {crop_rect, split_x, gutter_thickness}
+    half_frame_overrides: Optional[dict] = None  # {base_hash: {crop_rect, split_x, gutter_thickness}}
     hot_folder: bool = False
 
 
@@ -312,6 +316,7 @@ class AppController(QObject):
     rgb_scan_mode_changed = pyqtSignal(bool)  # the mode changed from somewhere other than its button
     zone_arm_changed = pyqtSignal(object)  # armed zone, or None
     asset_discovery_requested = pyqtSignal(AssetDiscoveryTask)
+    auto_detect_all_splits_requested = pyqtSignal(AutoDetectAllSplitsTask)
     library_search_requested = pyqtSignal(LibrarySearchTask)
     library_search_finished = pyqtSignal(int)  # frames found (0 = nothing matched)
     library_cleared = pyqtSignal()  # roots forgotten elsewhere — the panel must re-read them
@@ -331,7 +336,7 @@ class AppController(QObject):
     zoom_requested = pyqtSignal(float)
     zoom_changed = pyqtSignal(float)
     _render_cleanup_requested = pyqtSignal(object)  # texture to spare, or None
-    status_message_requested = pyqtSignal(str, int)
+    status_message_requested = pyqtSignal(str, int, str)
     status_progress_requested = pyqtSignal(int, int)
     batch_started = pyqtSignal(str, bool)  # title, abortable
     batch_progress = pyqtSignal(int, int, str)  # current, total, label
@@ -630,8 +635,9 @@ class AppController(QObject):
             return None
         return (float(val[0]), float(val[1]), float(val[2]))
 
-    def set_status(self, message: str, timeout: int = 0) -> None:
-        self.status_message_requested.emit(message, timeout)
+    def set_status(self, message: str, timeout: int = 0, kind: str = "info") -> None:
+        """kind: "info" | "warning" | "error" — the HUD colours the toast by it."""
+        self.status_message_requested.emit(message, timeout, kind)
 
     def _connect_signals(self) -> None:
         self.render_requested.connect(self.render_worker.process)
@@ -649,7 +655,6 @@ class AppController(QObject):
         self.export_worker.progress.connect(self._on_batch_progress)
         self.export_worker.finished.connect(self._on_export_finished)
         self.export_worker.cancelled.connect(self._on_export_batch_cancelled)
-        self.export_worker.error.connect(self._on_render_error)
         self.export_worker.error.connect(self._on_export_task_error)
 
         self.stitch_requested.connect(self.stitch_worker.run)
@@ -670,14 +675,12 @@ class AppController(QObject):
         self.thumb_worker.partial.connect(self._apply_thumbnails)
         self.thumb_worker.finished.connect(self._on_thumbnails_finished)
         self.thumb_worker.rendered_finished.connect(self._on_rendered_thumbnail)
-        self.thumb_worker.error.connect(self._on_render_error)
         self.thumb_worker.error.connect(self._on_thumbnail_batch_error)
 
         self.normalization_requested.connect(self.norm_worker.process)
         self.norm_worker.progress.connect(self._on_normalization_progress)
         self.norm_worker.finished.connect(self._on_normalization_finished)
         self.norm_worker.cancelled.connect(self._on_normalization_cancelled)
-        self.norm_worker.error.connect(self._on_render_error)
         self.norm_worker.error.connect(self._on_normalization_error)
 
         self.batch_autocrop_requested.connect(self.batch_autocrop_worker.process)
@@ -689,13 +692,14 @@ class AppController(QObject):
         self.asset_discovery_requested.connect(self.discovery_worker.process)
         self.discovery_worker.progress.connect(self._on_discovery_progress)
         self.discovery_worker.finished.connect(self._on_discovery_finished)
-        self.discovery_worker.error.connect(self._on_render_error)
         self.discovery_worker.error.connect(self._on_discovery_batch_error)
         self.discovery_worker.rgb_grouped.connect(self._on_rgb_grouped)
+        self.auto_detect_all_splits_requested.connect(self.discovery_worker.process_auto_detect_all_splits)
+        self.discovery_worker.splits_detected.connect(self._on_splits_detected)
         self.library_search_requested.connect(self.library_worker.search)
         self.library_worker.progress.connect(self._on_library_walk_progress)
         self.library_worker.finished.connect(self._on_library_search_finished)
-        self.library_worker.error.connect(self._on_render_error)
+        self.library_worker.error.connect(self._on_library_search_error)
 
         self.preview_load_requested.connect(self.preview_load_worker.process)
         self.preview_load_worker.splash.connect(self._on_splash_preview)
@@ -766,7 +770,7 @@ class AppController(QObject):
             if self._begin_batch("thumbnails", "Generating thumbnails", abortable=False) is None:
                 return
             self._thumb_requested = [asset_thumbnail_key(f) for f in missing]
-            self.set_status("GENERATING THUMBNAILS...")
+            self.set_status("Generating thumbnails…")
             # Copies, carrying each frame's stored film process. The source decode cannot
             # tell a slide from a negative reliably, and inverting a positive is what put
             # negatives in the filmstrip. They are copies because these dicts cross to a
@@ -783,7 +787,7 @@ class AppController(QObject):
         self.generate_missing_thumbnails()
 
     def _on_thumbnail_progress(self, current: int, total: int, name: str) -> None:
-        self.set_status(f"THUMBNAIL {current}/{total}: {name}")
+        self.set_status(f"Thumbnail {current}/{total}: {name}")
         self.status_progress_requested.emit(current, total)
         self.batch_progress.emit(current, total, name)
 
@@ -859,7 +863,7 @@ class AppController(QObject):
     def _batch_busy(self, requested: str) -> bool:
         if self._active_batch is None:
             return False
-        self.set_status(f"Cannot start {requested} while {self._active_batch_title} is running", 3000)
+        self.set_status(f"Cannot start {requested} while {self._active_batch_title} is running", 3000, kind="warning")
         return True
 
     def _end_batch(self, owner: str, token: Optional[int] = None) -> bool:
@@ -888,20 +892,23 @@ class AppController(QObject):
         owner = self._active_batch if self._active_batch in ("export", "contact_sheet") else "export"
         self._on_batch_cancelled(owner)
 
-    def _on_discovery_batch_error(self, _message: str) -> None:
+    def _on_discovery_batch_error(self, message: str) -> None:
         self._discovery_running = False
         self._hot_folder_sequence_active = False
         self._end_batch("discovery")
+        self._report_worker_error("Import", message)
 
-    def _on_thumbnail_batch_error(self, _message: str) -> None:
+    def _on_thumbnail_batch_error(self, message: str) -> None:
         self._hot_folder_sequence_active = False
         self._on_batch_error("thumbnails")
+        self._report_worker_error("Thumbnails", message)
 
     def _on_normalization_cancelled(self) -> None:
         self._on_batch_cancelled("normalization")
 
-    def _on_normalization_error(self, _message: str) -> None:
+    def _on_normalization_error(self, message: str) -> None:
         self._on_batch_error("normalization")
+        self._report_worker_error("Batch analysis", message)
 
     def _on_batch_error(self, owner: str) -> None:
         self._end_batch(owner)
@@ -971,6 +978,7 @@ class AppController(QObject):
             rgb_scan=bool(self.session.repo.get_global_setting("rgbscan_mode", False)),
             half_frame=bool(self.session.repo.get_global_setting("half_frame_mode", False)),
             half_frame_profile=self.half_frame_profile(),
+            half_frame_overrides=self.half_frame_overrides(),
             hot_folder=hot_folder,
         )
         if self._discovery_running:
@@ -1002,7 +1010,7 @@ class AppController(QObject):
         self._replace_after_discovery = request.replace_existing
         self._reselect_after_discovery = request.reselect_path
         self._active_discovery_keys = frozenset(_capture_import_key(path) for path in request.paths)
-        self.set_status("SCANNING FOR ASSETS...")
+        self.set_status("Scanning for assets…")
         stitches, merges = restore_maps(self.session.repo)
         task = AssetDiscoveryTask(
             paths=list(request.paths),
@@ -1015,6 +1023,7 @@ class AppController(QObject):
             restore_stitches=stitches,
             restore_hdr=merges,
             half_frame_profile=request.half_frame_profile,
+            half_frame_overrides=request.half_frame_overrides,
         )
         self.asset_discovery_requested.emit(task)
 
@@ -1063,7 +1072,7 @@ class AppController(QObject):
         if not roots:
             self.set_status("Add a library folder first", 4000)
             return
-        self.set_status("SEARCHING LIBRARY...")
+        self.set_status("Searching library…")
         self.library_search_requested.emit(
             LibrarySearchTask(
                 roots=roots,
@@ -1075,7 +1084,7 @@ class AppController(QObject):
         )
 
     def _on_library_walk_progress(self, walked: int) -> None:
-        self.set_status(f"SEARCHING LIBRARY... {walked} files")
+        self.set_status(f"Searching library… {walked} files")
 
     def _on_library_search_finished(self, paths: List[str]) -> None:
         self.library_search_finished.emit(len(paths))
@@ -1175,31 +1184,106 @@ class AppController(QObject):
     # ── half-frame split & crop profile ─────────────────────────────────
 
     _HALF_FRAME_PROFILE_KEY = "half_frame_profile"
+    _HALF_FRAME_OVERRIDES_KEY = "half_frame_overrides"
 
     def half_frame_profile(self) -> dict | None:
         """Saved ``(crop_rect, split_x, gutter_thickness)`` profile, shared across
-        every half-frame split. Scanner-independent — the same crop/split applies
-        whether the scans came from a SANE scanner, a camera copy-stand, or a
-        folder import."""
+        every half-frame split that has no override of its own. Scanner-independent —
+        the same crop/split applies whether the scans came from a SANE scanner, a
+        camera copy-stand, or a folder import."""
         return self.session.repo.get_global_setting(self._HALF_FRAME_PROFILE_KEY, default=None)
 
     def save_half_frame_profile(self, crop_rect, split_x: float, gutter_thickness: float) -> None:
         self.session.repo.save_global_setting(
             self._HALF_FRAME_PROFILE_KEY,
-            {
-                "crop_rect": list(crop_rect),
-                "split_x": float(split_x),
-                "gutter_thickness": float(gutter_thickness),
-            },
+            {"crop_rect": list(crop_rect), "split_x": float(split_x), "gutter_thickness": float(gutter_thickness)},
         )
 
-    def open_half_frame_dialog(self, file_path: str) -> dict | None:
-        """Open the half-frame split & crop editor on one scan; return the profile
-        dict on Apply, None on cancel."""
+    def half_frame_overrides(self) -> dict:
+        """Per-file ``(crop_rect, split_x, gutter_thickness)`` overrides, keyed by
+        base file hash — for the odd frame the roll-wide profile (auto-detected or
+        fixed) still gets wrong."""
+        return dict(self.session.repo.get_global_setting(self._HALF_FRAME_OVERRIDES_KEY, default=None) or {})
+
+    def half_frame_override(self, file_hash: str) -> dict | None:
+        return self.half_frame_overrides().get(file_hash)
+
+    def save_half_frame_override(self, file_hash: str, crop_rect, split_x: float, gutter_thickness: float) -> None:
+        overrides = self.half_frame_overrides()
+        overrides[file_hash] = {"crop_rect": list(crop_rect), "split_x": float(split_x), "gutter_thickness": float(gutter_thickness)}
+        self.session.repo.save_global_setting(self._HALF_FRAME_OVERRIDES_KEY, overrides)
+
+    def clear_half_frame_override(self, file_hash: str) -> None:
+        overrides = self.half_frame_overrides()
+        if file_hash in overrides:
+            del overrides[file_hash]
+            self.session.repo.save_global_setting(self._HALF_FRAME_OVERRIDES_KEY, overrides)
+
+    def _path_for_base_hash(self, file_hash: str) -> str:
+        return next((a["path"] for a in self.session.state.uploaded_files if base_hash(a.get("hash", "")) == file_hash), "")
+
+    def _half_frame_geometry_for(self, file_hash: str, file_path: str = "") -> HalfGeometry:
+        """This file's currently effective half geometry: its own override, else the
+        roll's saved profile, else — with no profile yet — the same per-file
+        auto-detect discovery falls back to."""
+        saved = self.half_frame_override(file_hash) or self.half_frame_profile()
+        if saved is not None:
+            cr = saved.get("crop_rect")
+            return HalfGeometry(
+                crop_rect=tuple(cr) if cr is not None else None,
+                split_x=float(saved.get("split_x") or 0.5),
+                gutter_thickness=float(saved.get("gutter_thickness") or 0.0),
+            )
+        if file_path:
+            from negpy.services.assets.half_frame import detect_split_x_for_file
+
+            return HalfGeometry(split_x=detect_split_x_for_file(file_path))
+        return HalfGeometry()
+
+    def _remap_half_frame_edits(self, file_hash: str, old_geom: HalfGeometry, new_geom: HalfGeometry) -> None:
+        """Re-anchor both halves' saved manual edits from ``old_geom`` to ``new_geom``,
+        so a heal stroke, dust spot, scratch line or dodge/burn mask stays on the same
+        physical film location when the split or crop moves."""
+        if old_geom == new_geom:
+            return
+        path = self._path_for_base_hash(file_hash)
+        for half in (1, 2):
+            h = half_hash(file_hash, half)
+            saved = self.session.repo.load_file_settings(h)
+            if saved is None:
+                continue
+            updated = remap_workspace_config(saved, half, old_geom, new_geom)
+            if updated == saved:
+                continue
+            self.session.push_external_history(h, saved, updated)
+            self.session.repo.save_file_settings(h, updated, file_path=path)
+
+    _HALF_FRAME_APPLY_SCOPE_KEY = "half_frame_apply_scope"
+
+    def open_half_frame_dialog(
+        self,
+        file_path: str,
+        file_hash: str,
+        selected_hashes: Optional[List[str]] = None,
+        initial_scope: Optional[str] = None,
+    ) -> dict | None:
+        """Open the half-frame split & crop editor on one scan, seeded from
+        ``file_hash``'s own effective geometry; on Apply, save the result and
+        return it, or None on cancel.
+
+        The dialog's own Apply split-button picks what gets written: its current
+        choice — ``"current"`` (``file_hash``'s own override), ``"selected"`` (the
+        same override on every hash in ``selected_hashes``) or ``"all"`` (the
+        roll-wide profile, which every file without its own override inherits) —
+        is read back after Apply and remembered as the next default, unless
+        ``initial_scope`` pins one (the per-frame context menu always starts at
+        ``"current"``, regardless of what was last used elsewhere). Either way,
+        each affected file's manual edits are re-anchored from its old effective
+        geometry to the new one first, so they stay put across the change.
+        """
         import numpy as np
 
         from negpy.desktop.view.widgets.half_frame_dialog import HalfFrameDialog
-        from negpy.services.assets.half_frame import detect_split_x
         from negpy.services.assets.thumbnails import decode_source_image
 
         try:
@@ -1208,33 +1292,94 @@ class AppController(QObject):
                 return None
             buf = np.asarray(img)
         except Exception as e:
-            self.set_status(f"Could not load preview: {e}")
+            self.set_status(f"Could not load preview: {e}", kind="error")
             return None
 
-        saved = self.half_frame_profile()
-        initial_rect = tuple(saved["crop_rect"]) if saved else None
-        initial_split = saved["split_x"] if saved else detect_split_x(buf)
-        initial_gutter = saved["gutter_thickness"] if saved else 0.0
-
+        old_geom = self._half_frame_geometry_for(file_hash, file_path)
+        saved_scope = initial_scope or self.session.repo.get_global_setting(self._HALF_FRAME_APPLY_SCOPE_KEY, "current")
         dialog = HalfFrameDialog(
             buf,
-            initial_rect=initial_rect,
-            initial_split=initial_split,
-            initial_gutter=initial_gutter,
+            initial_rect=old_geom.crop_rect,
+            initial_split=old_geom.split_x,
+            initial_gutter=old_geom.gutter_thickness,
+            initial_scope=saved_scope,
             parent=None,
         )
-        if dialog.exec():
-            profile = {
-                "crop_rect": list(dialog.crop_rect()),
-                "split_x": dialog.split_x(),
-                "gutter_thickness": dialog.gutter_thickness(),
-            }
-            self.save_half_frame_profile(profile["crop_rect"], profile["split_x"], profile["gutter_thickness"])
-            return profile
-        return None
+        if not dialog.exec():
+            return None
+
+        scope = dialog.scope()
+        self.session.repo.save_global_setting(self._HALF_FRAME_APPLY_SCOPE_KEY, scope)
+        cx1, cy1, cx2, cy2 = dialog.crop_rect()
+        result = {
+            "crop_rect": [cx1, cy1, cx2, cy2],
+            "split_x": dialog.split_x(),
+            "gutter_thickness": dialog.gutter_thickness(),
+        }
+        new_geom = HalfGeometry((cx1, cy1, cx2, cy2), result["split_x"], result["gutter_thickness"])
+
+        if scope == "all":
+            overrides = self.half_frame_overrides()
+            targets: set[str] = set()
+            for a in self.session.state.uploaded_files:
+                h = None if is_composite(a) else base_hash(a["hash"])
+                if h and h not in overrides:
+                    targets.add(h)
+            for h in targets:
+                self._remap_half_frame_edits(h, self._half_frame_geometry_for(h, self._path_for_base_hash(h)), new_geom)
+            self.save_half_frame_profile(result["crop_rect"], result["split_x"], result["gutter_thickness"])
+        else:
+            scoped_targets = selected_hashes if scope == "selected" and selected_hashes else [file_hash]
+            for h in scoped_targets:
+                self._remap_half_frame_edits(h, self._half_frame_geometry_for(h, self._path_for_base_hash(h)), new_geom)
+                self.save_half_frame_override(h, result["crop_rect"], result["split_x"], result["gutter_thickness"])
+        return result
+
+    def auto_detect_all_half_frame_splits(self) -> None:
+        """Re-find the gutter on every loaded scan, off the GUI thread — a one-shot
+        batch instead of adjusting each odd frame by hand. ``_on_splits_detected``
+        saves the results once detection finishes."""
+        targets: dict[str, str] = {}
+        for a in self.session.state.uploaded_files:
+            h = None if is_composite(a) else base_hash(a["hash"])
+            if h:
+                targets[h] = a["path"]
+        paths = list(targets.values())
+        if not paths:
+            return
+        self.set_status(f"Auto-detecting the split on {len(paths)} frame{'s' if len(paths) != 1 else ''}…")
+        self.status_progress_requested.emit(0, len(paths))
+        self.auto_detect_all_splits_requested.emit(AutoDetectAllSplitsTask(paths=paths))
+
+    def _on_splits_detected(self, detected: dict[str, float]) -> None:
+        """AutoDetectAllSplitsTask finished: save each file's own detected split as
+        its override, re-anchoring its manual edits from whatever geometry it used
+        before."""
+        self.status_progress_requested.emit(0, 0)
+        seen: set[str] = set()
+        for a in self.session.state.uploaded_files:
+            if is_composite(a) or a.get("path") not in detected:
+                continue
+            file_hash = base_hash(a["hash"])
+            if not file_hash or file_hash in seen:
+                continue
+            seen.add(file_hash)
+            old_geom = self._half_frame_geometry_for(file_hash, a["path"])
+            new_geom = replace(old_geom, split_x=detected[a["path"]])
+            self._remap_half_frame_edits(file_hash, old_geom, new_geom)
+            self.save_half_frame_override(
+                file_hash, new_geom.crop_rect or (0.0, 0.0, 1.0, 1.0), new_geom.split_x, new_geom.gutter_thickness
+            )
+        if not seen:
+            return
+        self.set_status(f"Auto-detected the split on {len(seen)} frame{'s' if len(seen) != 1 else ''}")
+        files = self.session.state.uploaded_files
+        self.request_asset_discovery(
+            [f["path"] for f in files if "path" in f], replace_existing=True, reselect_path=self.state.current_file_path
+        )
 
     def _on_discovery_progress(self, current: int, total: int, name: str) -> None:
-        self.set_status(f"HASHING {current}/{total}: {name}")
+        self.set_status(f"Hashing {current}/{total}: {name}")
         self.status_progress_requested.emit(current, total)
         self.batch_progress.emit(current, total, name)
 
@@ -1370,7 +1515,7 @@ class AppController(QObject):
                 target = next((i for i in ordered if i in new_indices), first_new_idx)
                 self.session.select_file(target)
         else:
-            self.set_status("NO SUPPORTED ASSETS FOUND", 3000)
+            self.set_status("No supported assets found", 3000, kind="warning")
             self.status_progress_requested.emit(0, 0)
             self._hot_folder_sequence_active = False
 
@@ -1455,20 +1600,15 @@ class AppController(QObject):
         """(asset dict with the split geometry stamped on, half configs) for a diptych.
 
         A whole-frame asset never went through `_expand_half_frames`, so the split comes
-        from the saved profile — the same one the halves were cut with.
+        from this file's own effective geometry — its override if it has one, else the
+        saved profile, else auto-detected — the same resolution the halves were cut with.
         """
         pair = self.diptych_pair(file_info)
         if pair is None:
             return file_info, None
-        profile = self.half_frame_profile() or {}
-        raw_rect = profile.get("crop_rect")
+        geom = self._half_frame_geometry_for(file_info.get("hash") or "", file_info.get("path", ""))
         return (
-            {
-                **file_info,
-                "split_x": float(profile.get("split_x") or 0.5),
-                "crop_rect": tuple(float(v) for v in raw_rect) if raw_rect else None,
-                "gutter_thickness": float(profile.get("gutter_thickness") or 0.0),
-            },
+            {**file_info, "split_x": geom.split_x, "crop_rect": geom.crop_rect, "gutter_thickness": geom.gutter_thickness},
             pair,
         )
 
@@ -2219,7 +2359,7 @@ class AppController(QObject):
         self.state.test_strip_pending = True
         self.test_strip_changed.emit(False)
         # A few seconds of renders, so tick the HUD or it reads as wedged.
-        self.status_message_requested.emit(toast, 2500)
+        self.set_status(toast, 2500)
         self.status_progress_requested.emit(0, len(overrides))
         cam_xyz, camera_wb = self._effective_cam_xyz()
         self.strip_requested.emit(
@@ -2279,7 +2419,7 @@ class AppController(QObject):
         self.state.test_strip_content_rect = content_rect
         self.test_strip_changed.emit(True)
         label = "Ring-around" if self.state.test_strip_kind == "color" else "Test strip"
-        self.status_message_requested.emit(f"{label} ready — click a patch to keep it", 4000)
+        self.set_status(f"{label} ready — click a patch to keep it", 4000)
 
     def rotate_test_strip(self, direction: int) -> bool:
         """Turn the ladder rather than the image while a proof is on the canvas; True = consumed.
@@ -2640,7 +2780,7 @@ class AppController(QObject):
         self._autocrop_cancel_requested = False
         self.status_progress_requested.emit(0, 0)
         logger.error("Auto Crop All failed: %s", message)
-        self.set_status(f"Auto Crop All failed: {message}", 5000)
+        self.set_status(f"Auto Crop All failed: {message}", 5000, kind="error")
 
     def detect_aspect_ratio(self) -> None:
         img = self.state.preview_raw
@@ -2770,7 +2910,7 @@ class AppController(QObject):
         rx, ry = CoordinateMapping.map_click_to_raw(nx, ny, uv_grid)
         line = trace_scratch(preview, rx, ry, self.state.config.retouch.scratch_threshold)
         if line is None:
-            self.status_message_requested.emit("No scratch found there — click directly on the line", 3000)
+            self.set_status("No scratch found there — click directly on the line", 3000, kind="warning")
             return
         self.session.update_config(
             replace(
@@ -3082,7 +3222,7 @@ class AppController(QObject):
         token = self._begin_batch("normalization", "Analyzing roll", abortable=True)
         if token is None:
             return
-        self.set_status("Starting Batch Normalization...")
+        self.set_status("Starting Batch Normalization…")
         task = NormalizationTask(
             frames=[NormalizationInput(file_info=a, config=self._config_for_batch_asset(a)) for a in visible_files],
             workspace_color_space=self.state.workspace_color_space,
@@ -3135,7 +3275,7 @@ class AppController(QObject):
         )
         self.session.update_config(replace(self.state.config, process=new_process), persist=True)
 
-        self.set_status("batch analysis complete", timeout=3000)
+        self.set_status("Batch analysis complete", timeout=3000)
         self.status_progress_requested.emit(0, 0)
         self.request_render()
 
@@ -3232,10 +3372,10 @@ class AppController(QObject):
 
         profile_id = FlatFieldProfiles.create(name, path)
         if profile_id is None:
-            self.set_status("Flat-field: could not read that reference image", 3000)
+            self.set_status("Flat Field: could not read that reference image", 3000, kind="error")
             return
         self.set_active_flatfield_profile(profile_id)
-        self.set_status(f"Flat-field profile '{name}' saved", 2000)
+        self.set_status(f"Flat Field profile '{name}' saved", 2000)
 
     def delete_flatfield_profile(self, profile_id: str) -> None:
         """
@@ -3380,7 +3520,7 @@ class AppController(QObject):
 
     def _on_stitch_error(self, message: str) -> None:
         self._end_batch("stitch")
-        self.set_status(message, 6000)
+        self.set_status(message, 6000, kind="error")
 
     def request_unstitch(self) -> None:
         """Dissolve the active stitched composite back into its part frames.
@@ -3496,7 +3636,7 @@ class AppController(QObject):
 
     def _on_hdr_error(self, message: str) -> None:
         self._end_batch("hdr")
-        self.set_status(message, 6000)
+        self.set_status(message, 6000, kind="error")
 
     def apply_config(self, config: WorkspaceConfig, persist: bool = False, readback_metrics: bool = True) -> None:
         """Adopt `config` and repaint by whichever route the change actually needs.
@@ -4183,10 +4323,13 @@ class AppController(QObject):
         The source is in camera primaries, so the camera matrix runs here: painting those
         numbers as display RGB flattens the film base, which on a C-41 negative reads as a
         mask that is far weaker than the one in the file. The multipliers fold into the
-        matrix when the decode skipped them (see should_fold_camera_wb), so the peek looks
-        the same either way and Linear RAW does not change what the mask looks like — except
-        on a narrowband capture, where they never fold: there is no scene white balance for
-        them to describe. The proof stays off — this is the scan, not a print.
+        matrix whenever the decode skipped them, narrowband included — the
+        rule the render path follows (should_fold_camera_wb) refuses them there because
+        narrowband light has no color temperature to reconstruct, but this view only has to
+        show the film as the eye and every raw viewer see it, and without them the mask
+        renders green. `lightbox_level` then supplies the brightness a decode with no
+        auto-brightness never got: one scalar, measured before the crop and applied after,
+        so framing does not change it. The proof stays off — this is the scan, not a print.
         """
         source = self.state.preview_raw
         if source is None:
@@ -4202,16 +4345,17 @@ class AppController(QObject):
             wants_uv_grid=False,
         )
         img = GeometryProcessor(geometry).process(source, context)
+        decoded_without_wb = effective_linear_raw(self.state.config.process, self.state.config.exposure.render_intent)
+        matrix = camera_to_working_matrix(
+            self.state.preview_cam_xyz,
+            self.state.preview_camera_wb if decoded_without_wb else None,
+        )
+        level = lightbox_level(img, matrix)
         if not context.crop_preview_full:
             img = CropProcessor(geometry).process(img, context)
-        fold_wb = should_fold_camera_wb(self.state.config.process, self.state.config.exposure.render_intent)
-        img = apply_camera_matrix(
-            img,
-            camera_to_working_matrix(
-                self.state.preview_cam_xyz,
-                self.state.preview_camera_wb if fold_wb else None,
-            ),
-        )
+        img = apply_camera_matrix(img, matrix)
+        if level is not None:
+            img = img * level
         with self.state.metrics_lock:
             self.state.last_metrics["base_positive"] = working_oetf_encode(img)
             self.state.last_metrics["content_rect"] = None
@@ -4732,7 +4876,7 @@ class AppController(QObject):
 
         presets = self._enabled_presets()
         if not presets:
-            QMessageBox.information(None, "No presets enabled", "Enable at least one export preset in the Export panel.")
+            QMessageBox.information(None, "No Presets Enabled", "Enable at least one export preset in the Export panel.")
             return
 
         if not self._validate_preset_paths(presets):
@@ -4896,7 +5040,7 @@ class AppController(QObject):
                 None,
                 "Export",
                 f"JPEG XL can't tag the selected color space ({names}).\n"
-                "Choose sRGB, P3 D65, Rec 2020 or Greyscale, or a different format.",
+                "Choose sRGB, P3 D65, Rec 2020 or Grayscale, or a different format.",
             )
             return
 
@@ -4963,10 +5107,10 @@ class AppController(QObject):
         box = QMessageBox()
         box.setIcon(QMessageBox.Icon.Warning)
         if n == 1:
-            box.setWindowTitle("File already exists")
+            box.setWindowTitle("File Already Exists")
             box.setText(f"“{os.path.basename(conflicts[0])}” already exists in the export folder.")
         else:
-            box.setWindowTitle("Files already exist")
+            box.setWindowTitle("Files Already Exist")
             box.setText(f"{count_of(n, 'file')} already {plural(n, 'exists', 'exist')} in the export destination.")
         box.setInformativeText(f"{names}\n\nOverwrite, save with a new name, or cancel?")
 
@@ -5073,7 +5217,7 @@ class AppController(QObject):
 
         if metrics.get("gpu_fallback") and not self._gpu_fallback_notified:
             self._gpu_fallback_notified = True
-            self.set_status("GPU acceleration failed — using CPU", 5000)
+            self.set_status("GPU acceleration failed — using CPU", 5000, kind="warning")
 
         # A render already in flight when the peek went on would otherwise repaint over it.
         if self.state.negative_peek:
@@ -5215,14 +5359,24 @@ class AppController(QObject):
     def _on_render_error(self, message: str) -> None:
         self.state.is_processing = self._is_rendering = False
         self._busy_toast = False  # the failure message below replaces the toast
-        logger.error(f"Worker failure: {message}")
-        self.set_status(f"Failed to load file: {message}", 5000)
+        logger.error(f"Render failure: {message}")
+        self.set_status(f"Failed to load file: {message}", 5000, kind="error")
         self.load_failed.emit()
 
         self._dispatch_pending_render()
 
-    def _on_export_task_error(self, _message: str) -> None:
+    def _on_export_task_error(self, message: str) -> None:
         self._export_failures += 1
+        self._report_worker_error("Export", message)
+
+    def _report_worker_error(self, source: str, message: str) -> None:
+        """A background job failed. Names the job and leaves the canvas alone: only a failed
+        load of the shown frame (_on_render_error) may blank it."""
+        logger.error(f"{source} failed: {message}")
+        self.set_status(f"{source} failed: {message}", 6000, kind="error")
+
+    def _on_library_search_error(self, message: str) -> None:
+        self._report_worker_error("Library search", message)
 
     def _on_export_finished(self) -> None:
         elapsed = time.time() - self._export_start_time

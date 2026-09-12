@@ -44,6 +44,7 @@ from negpy.features.geometry.logic import (
     compute_distortion_scale,
     get_manual_rect_coords,
 )
+from negpy.features.geometry.models import GeometryConfig
 from negpy.features.lab.logic import gaussian_kernel_1d, rl_iterations
 from negpy.features.lab.models import SharpenMethod
 from negpy.features.altprocess.models import AltProcess
@@ -115,6 +116,49 @@ def _downsample_for_analysis(img: np.ndarray, max_size: int) -> np.ndarray:
     return cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
 
+def _build_analysis_source(
+    img: np.ndarray,
+    geometry: GeometryConfig,
+    roi: Optional[Tuple[int, int, int, int]],
+    analysis_buffer: float,
+    analysis_rect: Optional[tuple],
+    tiling_mode: bool,
+    max_size: int,
+) -> Tuple[np.ndarray, float]:
+    """The shared meter grid's own buffer: sliced, oriented and downsampled once for
+    every meter reading it.
+
+    Downsampled before fine rotation and keystone, not after: both are full-frame
+    resamples whose cost scales with pixel count, and only a meter reads the result,
+    so warping the full-res crop just to shrink it away spends the expensive part on
+    pixels the analysis never sees.
+    """
+    analysis_source = img
+    if geometry.rotation != 0:
+        analysis_source = np.rot90(analysis_source, k=geometry.rotation)
+    if geometry.flip_horizontal:
+        analysis_source = np.fliplr(analysis_source)
+    if geometry.flip_vertical:
+        analysis_source = np.flipud(analysis_source)
+    # A freehand analysis_rect overrides the crop ROI and centered buffer, like the
+    # CPU path. Tiled export uses explicit overrides, so it stays on the ROI.
+    base_roi = roi if not tiling_mode else None
+    analysis_roi, an_buffer = resolve_analysis_region(
+        analysis_source.shape, base_roi, analysis_buffer, analysis_rect if not tiling_mode else None
+    )
+    if analysis_roi is not None:
+        ay1, ay2, ax1, ax2 = analysis_roi
+        analysis_source = np.ascontiguousarray(analysis_source[ay1:ay2, ax1:ax2])
+    analysis_source = _downsample_for_analysis(analysis_source, max_size)
+    if geometry.fine_rotation != 0.0:
+        analysis_source = apply_fine_rotation(analysis_source, geometry.fine_rotation)
+    # The meters must read the frame the print stage gets. The CPU engine normalizes
+    # the keystoned buffer, so this replay has to carry it too or the two engines
+    # measure different bounds.
+    analysis_source = apply_keystone(analysis_source, geometry.converge_v, geometry.converge_h)
+    return analysis_source, an_buffer
+
+
 def _binding_identity(idx: int, res: Any) -> tuple:
     """Hashable identity for the bind-group cache. Pooled views/persistent buffers keep the
     same object across frames, so id() is stable."""
@@ -135,9 +179,18 @@ def _keystone_inverse_bytes(converge_v: float, converge_h: float) -> bytes:
 def _analysis_cache_key(settings: WorkspaceConfig, analysis_source_hash: str) -> tuple:
     """Identity of the auto-exposure analysis: only the fields the meter reads.
     White/black point offsets and trims apply downstream as uniforms and must
-    not invalidate it."""
+    not invalidate it.
+
+    Of geometry, only what selects the analyzed region: rotation and flips change
+    the buffer's own shape, crop_rect/autocrop_offset the ROI within it. Fine
+    rotation, keystone and distortion reshuffle pixels within that same region
+    (_build_analysis_source applies them to the meter's own buffer) without
+    changing what region it is, so dragging one of those sliders must not blow
+    this cache the way a creative slider does not.
+    """
     e = settings.exposure
     p = settings.process
+    g = settings.geometry
     return (
         analysis_source_hash,
         p.process_mode,
@@ -155,7 +208,11 @@ def _analysis_cache_key(settings: WorkspaceConfig, analysis_source_hash: str) ->
         p.crosstalk_strength,
         p.crosstalk_matrix,
         p.crosstalk_process,
-        settings.geometry,
+        g.rotation,
+        g.flip_horizontal,
+        g.flip_vertical,
+        g.crop_rect,
+        g.autocrop_offset,
         e.cast_removal_strength > 0.0,
         e.auto_exposure,
         e.auto_normalize_contrast,
@@ -285,6 +342,7 @@ class GPUEngine:
         # No config field carries render_size_ref, so a size-only change would
         # otherwise resume past the layout pass.
         self._last_render_size_ref: Optional[float] = None
+        self._last_full_frame: bool = False
         # (radius, scale_factor) of the sharpen taps currently in sharpen_k.
         self._sharpen_kernel_key: Optional[tuple] = None
 
@@ -308,7 +366,9 @@ class GPUEngine:
         # Identity of the plane currently sitting in the contrast_mask texture.
         self._mask_tex_key: Optional[Tuple] = None
 
-    def _detect_invalidated_stage(self, settings: WorkspaceConfig, scale_factor: float, render_size_ref: Optional[float] = None) -> int:
+    def _detect_invalidated_stage(
+        self, settings: WorkspaceConfig, scale_factor: float, render_size_ref: Optional[float] = None, full_frame: bool = False
+    ) -> int:
         """
         Determines the earliest pipeline stage that needs re-running.
         Returns stage index (5 unused — dodge/burn lives in the exposure pass):
@@ -326,6 +386,10 @@ class GPUEngine:
             or self._last_scale_factor != scale_factor
             or self._last_render_size_ref != render_size_ref
             or self._last_settings.process.process_mode != settings.process.process_mode
+            # Toggling the crop tool changes only the late-stage dispatch extent (see
+            # full_frame in process_to_texture), but that resizes every texture from
+            # toning on, so cached ones at the other extent cannot be reused.
+            or self._last_full_frame != full_frame
         ):
             return 0
 
@@ -490,9 +554,16 @@ class GPUEngine:
         cam_xyz: Optional[list] = None,
         camera_wb: Optional[list] = None,
         contrast_mask_override: Optional[Tuple[np.ndarray, float, Tuple[int, int, int, int]]] = None,
+        full_frame: bool = False,
     ) -> Tuple[Any, Dict[str, Any]]:
         """
         Executes the full pipeline, returning a GPU texture and associated metrics.
+
+        ``full_frame``: the crop tool's own preview, which shows the whole rotated
+        frame outside the crop rectangle too. Widens only the late-stage dispatch
+        extent (toning/finish/layout); the meter, the contrast mask and the
+        reported ``active_roi`` stay on the real crop, so the crop tool's overlay
+        still tracks it and the print exposure the CPU engine would compute.
 
         ``local_maps`` is the pre-rasterised (h, w, 2) dodge/burn EV + local grade
         map already in the post-geometry frame; tiled export passes a per-tile slice.
@@ -524,7 +595,7 @@ class GPUEngine:
         elif tiling_mode:
             start_stage = 0
         else:
-            start_stage = self._detect_invalidated_stage(settings, scale_factor, render_size_ref)
+            start_stage = self._detect_invalidated_stage(settings, scale_factor, render_size_ref, full_frame)
 
         # ROI calculation
         if tiling_mode and full_dims:
@@ -555,8 +626,12 @@ class GPUEngine:
                 roi = apply_margin_to_roi((0, h_rot, 0, w_rot), h_rot, w_rot, margin)
             else:
                 roi = (0, h_rot, 0, w_rot)
-            y1, y2, x1, x2 = roi
-            crop_w, crop_h = max(1, x2 - x1), max(1, y2 - y1)
+        # roi stays the real crop throughout, for the meter, the contrast mask and the
+        # reported overlay -- all of which the crop tool's full_frame preview must still
+        # match the CPU engine on. Only the render's own dispatch extent (the late,
+        # crop-fused stages) widens to the whole rotated frame while it is on.
+        y1, y2, x1, x2 = (0, h_rot, 0, w_rot) if full_frame and not tiling_mode else roi
+        crop_w, crop_h = max(1, x2 - x1), max(1, y2 - y1)
 
         # Reuse the per-source meter across creative-slider previews: fill any missing
         # override from the cache so the needs_* gates below skip the analysis entirely.
@@ -623,7 +698,12 @@ class GPUEngine:
             prefilter_key = (
                 (
                     analysis_source_hash,
-                    settings.geometry,
+                    # roi already reflects rotation/crop_rect/autocrop_offset; flips are the
+                    # one region-selecting field it doesn't carry. Fine rotation, keystone and
+                    # distortion reshuffle pixels within the region without changing it, so
+                    # they must not blow this cache the way a creative slider does not.
+                    settings.geometry.flip_horizontal,
+                    settings.geometry.flip_vertical,
                     roi,
                     p.analysis_buffer,
                     p.analysis_rect,
@@ -642,33 +722,15 @@ class GPUEngine:
                 cam_prefiltered = self._prefilter_cache[4]
             else:
                 # Use views to avoid copying the full-res image; crop to ROI first.
-                analysis_source = img
-                if settings.geometry.rotation != 0:
-                    analysis_source = np.rot90(analysis_source, k=settings.geometry.rotation)
-                if settings.geometry.flip_horizontal:
-                    analysis_source = np.fliplr(analysis_source)
-                if settings.geometry.flip_vertical:
-                    analysis_source = np.flipud(analysis_source)
-                # A freehand analysis_rect overrides the crop ROI and centered buffer, like the
-                # CPU path. Tiled export uses explicit overrides, so it stays on the ROI.
-                base_roi = roi if not tiling_mode else None
-                analysis_roi, an_buffer = resolve_analysis_region(
-                    analysis_source.shape,
-                    base_roi,
+                analysis_source, an_buffer = _build_analysis_source(
+                    img,
+                    settings.geometry,
+                    roi,
                     settings.process.analysis_buffer,
-                    settings.process.analysis_rect if not tiling_mode else None,
+                    settings.process.analysis_rect,
+                    tiling_mode,
+                    APP_CONFIG.preview_render_size,
                 )
-                if analysis_roi is not None:
-                    ay1, ay2, ax1, ax2 = analysis_roi
-                    analysis_source = np.ascontiguousarray(analysis_source[ay1:ay2, ax1:ax2])
-                if settings.geometry.fine_rotation != 0.0:
-                    analysis_source = apply_fine_rotation(analysis_source, settings.geometry.fine_rotation)
-                # The meters must read the frame the print stage gets. The CPU engine
-                # normalizes the keystoned buffer, so this replay has to carry it too or the
-                # two engines measure different bounds.
-                analysis_source = apply_keystone(analysis_source, settings.geometry.converge_v, settings.geometry.converge_h)
-
-                analysis_source = _downsample_for_analysis(analysis_source, APP_CONFIG.preview_render_size)
                 # Shared prefilter, once for all five meters (ROI already applied).
                 # Unmixed like the CPU path so every meter reads the unmixed film.
                 prefiltered = unmix_log_image(prefilter_log_grid(analysis_source, None, an_buffer), unmix_m)
@@ -1345,6 +1407,7 @@ class GPUEngine:
                     k1_eff,
                     settings.geometry.converge_v,
                     settings.geometry.converge_h,
+                    full_frame,
                 )
                 if self._uv_grid_cache is not None and self._uv_grid_cache[0] == uv_key:
                     metrics["uv_grid"] = self._uv_grid_cache[1]
@@ -1357,7 +1420,9 @@ class GPUEngine:
                         flip_h=settings.geometry.flip_horizontal,
                         flip_v=settings.geometry.flip_vertical,
                         autocrop=True,
-                        autocrop_params={"roi": roi} if roi else None,
+                        # Matches the CPU engine: the crop tool's full-frame preview must not
+                        # slice the grid down to the crop it isn't rendering right now.
+                        autocrop_params={"roi": roi} if roi and not full_frame else None,
                         distortion_k1=k1_eff,
                         converge_v=settings.geometry.converge_v,
                         converge_h=settings.geometry.converge_h,
@@ -1371,6 +1436,7 @@ class GPUEngine:
         self._last_targets_rev = exposure_models.TARGETS_REVISION
         self._last_scale_factor = scale_factor
         self._last_render_size_ref = render_size_ref
+        self._last_full_frame = full_frame
         return tex_final, metrics
 
     def _upload_unified_uniforms(

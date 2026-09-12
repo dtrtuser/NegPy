@@ -5,7 +5,10 @@ defines what is kept (everything outside is discarded). A vertical centerline
 inside the rectangle marks the split between the two halves; its thickness
 discards a band centered on it (the physical black separator between exposures).
 
-Read after ``exec()`` via ``crop_rect()``, ``split_x()`` and ``gutter_thickness()``.
+Read after ``exec()`` via ``crop_rect()``, ``split_x()``, ``gutter_thickness()`` and
+``scope()`` — the Apply button's own split-button picks what the result gets
+applied to (this frame, the selection, or the whole roll); the caller only carries
+out whichever the user picked.
 """
 
 from typing import Optional
@@ -13,11 +16,12 @@ from typing import Optional
 import numpy as np
 import qtawesome as qta
 from PyQt6.QtCore import QPoint, QRect, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QMouseEvent, QPainter, QPen, QPixmap
+from PyQt6.QtGui import QActionGroup, QColor, QMouseEvent, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QDialog,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QPushButton,
     QSizePolicy,
     QSlider,
@@ -26,6 +30,23 @@ from PyQt6.QtWidgets import (
 
 from negpy.desktop.view.styles.templates import pin_dialog_default
 from negpy.desktop.view.styles.theme import THEME
+from negpy.desktop.view.widgets.split_button import make_split_button
+
+
+def _with_alpha(hex_color: str, alpha: int) -> QColor:
+    c = QColor(hex_color)
+    c.setAlpha(alpha)
+    return c
+
+
+# key -> (menu label, split-button label), the same current/selected/all scopes the
+# Export button offers, chosen here rather than before the dialog even opens, since
+# what to apply to is a decision made after seeing the frame, not before.
+APPLY_SCOPES = {
+    "current": ("Apply to current frame", " Apply to Current"),
+    "selected": ("Apply to selected frames", " Apply to Selected"),
+    "all": ("Apply to all frames", " Apply to All"),
+}
 
 _HANDLE_TOL = 0.04
 _HANDLE_PX = 5
@@ -256,10 +277,10 @@ class _HalfFrameLabel(QLabel):
                 if o.width() > 0 and o.height() > 0:
                     painter.drawRect(o)
             # Crop rect
-            painter.setPen(QPen(QColor("#1D9E75"), 2))
+            painter.setPen(QPen(QColor(THEME.status_success), 2))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(wr)
-            painter.setBrush(QColor("#1D9E75"))
+            painter.setBrush(QColor(THEME.status_success))
             painter.setPen(Qt.PenStyle.NoPen)
             for corner in (wr.topLeft(), wr.topRight(), wr.bottomRight(), wr.bottomLeft()):
                 painter.drawRect(QRect(corner.x() - _HANDLE_PX, corner.y() - _HANDLE_PX, 2 * _HANDLE_PX, 2 * _HANDLE_PX))
@@ -270,14 +291,14 @@ class _HalfFrameLabel(QLabel):
             gw = max(0, int(self._gutter * span * draw_rect.width()))
             if gw > 0:
                 painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QColor(224, 168, 60, 120))
+                painter.setBrush(_with_alpha(THEME.warn_amber, 120))
                 painter.drawRect(QRect(cx - gw // 2, wr.top(), gw, wr.height()))
-            pen = QPen(QColor("#E0A83C"), 2)
+            pen = QPen(QColor(THEME.warn_amber), 2)
             pen.setStyle(Qt.PenStyle.DashLine)
             painter.setPen(pen)
             painter.drawLine(cx, wr.top(), cx, wr.bottom())
         else:
-            painter.fillRect(self.rect(), QColor("#0D0D0F"))
+            painter.fillRect(self.rect(), QColor(THEME.bg_dark))
             painter.setPen(QColor(THEME.text_muted))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No preview")
         painter.end()
@@ -296,10 +317,12 @@ class HalfFrameDialog(QDialog):
         initial_rect: Optional[tuple[float, float, float, float]] = None,
         initial_split: Optional[float] = None,
         initial_gutter: Optional[float] = None,
+        initial_scope: str = "current",
+        title: str = "Half Frame — split & crop",
         parent=None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Half Frame — split & crop")
+        self.setWindowTitle(title)
         self.setModal(True)
         self.resize(720, 560)
 
@@ -341,12 +364,24 @@ class HalfFrameDialog(QDialog):
         self._cancel_btn = QPushButton("Cancel")
         self._cancel_btn.clicked.connect(self.reject)
         btn_row.addWidget(self._cancel_btn)
-        self._ok_btn = QPushButton("Apply")
-        self._ok_btn.setIcon(qta.icon("fa5s.check", color=THEME.text_primary))
+
+        apply_menu = QMenu(self)
+        group = QActionGroup(apply_menu)
+        group.setExclusive(True)
+        self._scope_actions = {}
+        for key, (menu_label, _btn_label) in APPLY_SCOPES.items():
+            act = apply_menu.addAction(menu_label)
+            act.setCheckable(True)
+            act.triggered.connect(lambda _checked=False, k=key: self._set_scope(k))
+            group.addAction(act)
+            self._scope_actions[key] = act
+        container, self._ok_btn, self._scope_btn = make_split_button("Apply", "fa5s.check", apply_menu, primary=True)
         self._ok_btn.clicked.connect(self.accept)
-        btn_row.addWidget(self._ok_btn)
+        btn_row.addWidget(container)
         pin_dialog_default(self._ok_btn, self._auto_btn, self._reset_btn, self._cancel_btn)
         layout.addLayout(btn_row)
+
+        self._set_scope(initial_scope if initial_scope in APPLY_SCOPES else "current")
 
         self._preview_rgb = preview_rgb
         self._set_preview(preview_rgb)
@@ -384,6 +419,11 @@ class HalfFrameDialog(QDialog):
         self._label.set_split(sx)
         self._update_gutter_label()
 
+    def _set_scope(self, key: str) -> None:
+        self._scope = key
+        self._scope_actions[key].setChecked(True)
+        self._ok_btn.setText(APPLY_SCOPES[key][1])
+
     def _on_reset(self) -> None:
         self._label.set_rect((0.0, 0.0, 1.0, 1.0))
         self._label.set_split(0.5)
@@ -401,3 +441,7 @@ class HalfFrameDialog(QDialog):
 
     def gutter_thickness(self) -> float:
         return self._label.gutter_value()
+
+    def scope(self) -> str:
+        """What Apply was set to when clicked: 'current', 'selected' or 'all'."""
+        return self._scope

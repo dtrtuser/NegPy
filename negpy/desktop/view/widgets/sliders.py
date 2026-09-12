@@ -313,10 +313,13 @@ class CompactSlider(BaseSlider):
         self._edited_dot = EditedDot()
 
         self.spin.setSingleStep(step)
+        # The slider's own arrow-key step lives in its internal precision-scaled int
+        # space; without the scaling, a fractional step (most of them) never reaches
+        # it and every slider falls back to Qt's raw 1-unit default (1/precision).
+        self.slider.setSingleStep(max(1, round(step * precision)))
         if step >= 1.0:
             self.spin.setDecimals(0)
             self.slider.setTickInterval(int(step))
-            self.slider.setSingleStep(int(step))
 
         if unit:
             self.spin.setSuffix(unit)
@@ -663,7 +666,7 @@ class RangeSlider(QWidget):
         y = 35
 
         # Draw Groove
-        painter.setPen(QPen(QColor("#444"), 4))
+        painter.setPen(QPen(QColor(THEME.border_color), 4))
         painter.drawLine(self._margin, y, self.width() - self._margin, y)
 
         # Draw Active Part
@@ -676,7 +679,7 @@ class RangeSlider(QWidget):
         r = self._handle_r
         for cx in (x1, x2):
             painter.setBrush(QColor(THEME.accent_primary))
-            painter.setPen(QPen(QColor("#050505"), 1))
+            painter.setPen(QPen(QColor(THEME.canvas_bg_black), 1))
             painter.drawEllipse(cx - r, y - r, r * 2, r * 2)
 
     def _get_val(self, x: int) -> float:
