@@ -27,6 +27,10 @@ Controls map onto the existing Print sliders, each neutral at its current defaul
   WB C/M/Y (0)   -> per-channel density offsets
   shadow/highlight_density (0.0) -> Zone Density, the print path's mid-sparing offsets,
                     re-centred onto this curve's own scale (see zone_geometry)
+  dye_separation (1.0) -> density-domain saturation, applied directly to density
+                    (there is no paper dye matrix here to compose it into)
+  separation_damping (0.0) -> tapers that saturation by each pixel's own chroma
+                    (see logic.separation_damping_gain)
 """
 
 from typing import Optional, Tuple
@@ -34,7 +38,15 @@ from typing import Optional, Tuple
 import numpy as np
 
 from negpy.domain.types import ImageBuffer
-from negpy.features.exposure.logic import per_channel_toe_shoulder, per_channel_widths
+from negpy.features.exposure.logic import (
+    _fast_sigmoid,
+    effective_grade_range,
+    grade_to_slope,
+    per_channel_dye_separation,
+    per_channel_toe_shoulder,
+    per_channel_widths,
+    separation_damping_gain_np,
+)
 from negpy.features.exposure.models import EXPOSURE_CONSTANTS, ExposureConfig
 from negpy.kernel.image.validation import ensure_image
 
@@ -97,6 +109,23 @@ def zone_geometry() -> Tuple[float, float, float]:
         highlight * TRANSFER_DENSITY_RANGE,
         float(c["zone_density_sharpness"]) * span / TRANSFER_DENSITY_RANGE,
     )
+
+
+def wb_split_geometry() -> Tuple[float, float]:
+    """(centre, sharpness) for the Shadows/Highlights white-balance split, in density.
+
+    Same tonal-position mapping as zone_geometry(): the print path's regional-CMY
+    blend (logic.py, "Regional CMY") centres on the paper's anchor density with a
+    fixed sharpness of 3.0 on the print's own scale. Both carried across by fraction
+    of span, not by the raw numbers, for the same reason zone_geometry gives.
+    """
+    c = EXPOSURE_CONSTANTS
+    d_min, d_max = float(c["d_min"]), float(c["d_max"])
+    span = d_max - d_min
+    anchor = float(c["anchor_target_density"])
+    centre = (anchor - d_min) / span * TRANSFER_DENSITY_RANGE
+    sharpness = 3.0 * span / TRANSFER_DENSITY_RANGE
+    return centre, sharpness
 
 
 def display_rendering(scene_linear: np.ndarray) -> np.ndarray:
@@ -165,6 +194,93 @@ def transfer_widths(config: ExposureConfig) -> Tuple[Tuple[float, float, float],
     )
 
 
+def transfer_assumed_anchor() -> float:
+    """Fraction of the fixed window a properly exposed frame's own metered midtone is
+    expected to sit at -- the position Auto Density's partial metering blends toward
+    (see measure_anchor_from_log's `assumed`). transfer_contrast_pivot already places
+    mid-grey at this density independently; expressed as a fraction here because the
+    window's own span is what the blend needs to know."""
+    return float(TRANSFER_CONSTANTS["transfer_contrast_pivot"]) / TRANSFER_DENSITY_RANGE
+
+
+def transfer_shadow_reach_density() -> float:
+    """shadow_reach_density carried onto this curve's own scale by tonal position, like
+    zone_geometry: the two curves don't share a density scale, so the raw number would
+    land at a different fraction of black."""
+    c = EXPOSURE_CONSTANTS
+    d_min, span = float(c["d_min"]), float(c["d_max"]) - float(c["d_min"])
+    return (float(c["shadow_reach_density"]) - d_min) / span * TRANSFER_DENSITY_RANGE
+
+
+def transfer_highlight_hold_density() -> float:
+    """highlight_hold_density carried onto this curve's own scale, same technique."""
+    c = EXPOSURE_CONSTANTS
+    d_min, span = float(c["d_min"]), float(c["d_max"]) - float(c["d_min"])
+    return (float(c["highlight_hold_density"]) - d_min) / span * TRANSFER_DENSITY_RANGE
+
+
+def transfer_auto_terms(
+    exposure: ExposureConfig,
+    manual_offset: float,
+    manual_contrast: float,
+    textural_range: Optional[float],
+    anchor: Optional[float],
+    shadow_point: Optional[float],
+    highlight_point: Optional[float],
+) -> Tuple[float, float, float]:
+    """
+    (exposure_offset, contrast, highlight_density_auto) with Auto Density/Auto Grade
+    folded onto the manual values -- single source for CPU and GPU. Mirrors the paper
+    path's own anchor placement, effective_grade_range, Shadow Reach and Highlight
+    Hold, restated on this curve's plain density-linear model instead of the paper's
+    toe/shoulder one. A None input (the toggle off, or a raw un-normalized slide,
+    which never meters -- see is_transfer_path) leaves every term at its manual value.
+    """
+    c = TRANSFER_CONSTANTS
+    pivot = float(c["transfer_contrast_pivot"])
+    R = TRANSFER_DENSITY_RANGE
+
+    # Auto Density: place the metered anchor at the same pivot Grade already rotates
+    # about, so a later contrast change does not re-shift the brightness placed here.
+    auto_offset = 0.0
+    if exposure.auto_exposure and anchor is not None:
+        auto_offset = float(anchor) * R - pivot
+    offset = manual_offset + auto_offset
+
+    contrast = manual_contrast
+    if exposure.auto_normalize_contrast and textural_range is not None:
+        effective_range = effective_grade_range(True, R, textural_range)
+        k_ref = grade_to_slope(float(c["transfer_grade_ref"]), R)
+        if k_ref > 1e-9:
+            contrast = grade_to_slope(float(exposure.grade), effective_range) / k_ref
+
+    # Shadow Reach: never lowers contrast, only raises it so the textured dark tail
+    # still reaches shadow_reach_density. Same guard as the paper path: too little
+    # span between anchor and shadow_point to solve a slope from.
+    if exposure.auto_normalize_contrast and anchor is not None and shadow_point is not None:
+        span = float(shadow_point) - float(anchor)
+        if span > 1e-6:
+            d_shadow = float(shadow_point) * R - offset
+            denom = d_shadow - pivot
+            if denom > 1e-6:
+                needed = (transfer_shadow_reach_density() - pivot) / denom
+                contrast = min(max(contrast, needed), float(EXPOSURE_CONSTANTS["slope_max"]))
+
+    # Highlight Hold: an automatic highlight-zone burn, riding the same Zone Density
+    # kernel the Shadows/Highlights Density sliders already use on this curve. Never
+    # lifts; 0 once the tone already holds.
+    highlight_auto = 0.0
+    if exposure.auto_normalize_contrast and highlight_point is not None:
+        target = transfer_highlight_hold_density()
+        d_highlight = pivot + (float(highlight_point) * R - offset - pivot) * contrast
+        if d_highlight < target:
+            _sh_c, hi_c, k_zone = zone_geometry()
+            w_hi = 1.0 - _fast_sigmoid(k_zone * (d_highlight - hi_c))
+            highlight_auto = min((target - d_highlight) / max(w_hi, 1e-6), float(EXPOSURE_CONSTANTS["highlight_hold_max"]))
+
+    return offset, contrast, highlight_auto
+
+
 def transfer_curve_params(
     config: ExposureConfig,
 ) -> Tuple[float, float, Tuple[float, float, float], Tuple[float, float, float]]:
@@ -202,9 +318,14 @@ def apply_transfer_curve(
     density_range: float = TRANSFER_DENSITY_RANGE,
     shadow_density: float = 0.0,
     highlight_density: float = 0.0,
+    shadow_cmy: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+    highlight_cmy: Tuple[float, float, float] = (0.0, 0.0, 0.0),
     cast_gain: Tuple[float, float, float] = (1.0, 1.0, 1.0),
     cast_offset: Tuple[float, float, float] = (0.0, 0.0, 0.0),
     positive_source: bool = False,
+    separation: float = 1.0,
+    separation_trims: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+    damping: float = 0.0,
 ) -> ImageBuffer:
     """
     Normalized log density -> scene-linear positive.
@@ -217,6 +338,14 @@ def apply_transfer_curve(
     adjustment of it. `positive_source` skips both and passes the scene through unshaped.
 
     `cast_offset` arrives already scaled by density_range (see neutral_axis_affine).
+
+    `separation`/`separation_trims` are Dye Separation and its per-channel trims,
+    applied after the curve shapes each channel and before decode. They share their
+    math with the print path's resolve_saturation_matrix but not its paper crosstalk:
+    this curve has no paper dye matrix to compose into, so each channel scales its own
+    deviation from the frame's mean density directly rather than through a 3x3 matmul.
+    `damping` is Separation Damping, tapering each channel's own k by each pixel's own
+    chroma (see logic.separation_damping_gain); inert at separation 1.0, same as on the print.
     """
     c = TRANSFER_CONSTANTS
     base_width = float(c["transfer_knee_width"])
@@ -227,7 +356,7 @@ def apply_transfer_curve(
     sh_knee = float(c["transfer_shoulder_knee"])
 
     n = np.asarray(img_norm, dtype=np.float32)
-    out = np.empty_like(n)
+    dens = np.empty_like(n)
     for ch in range(3):
         d = n[:, :, ch] * np.float32(density_range)
 
@@ -243,6 +372,14 @@ def apply_transfer_curve(
 
         if contrast != 1.0:
             d = np.float32(pivot) + (d - np.float32(pivot)) * np.float32(contrast)
+
+        # Shadows/Highlights WB: regional CMY, using the print path's own kernel
+        # (logic.py, "Regional CMY") and geometry (wb_split_geometry).
+        if shadow_cmy[ch] != 0.0 or highlight_cmy[ch] != 0.0:
+            wb_c, wb_k = wb_split_geometry()
+            w_sh = _sigmoid(np.float32(wb_k) * (d - np.float32(wb_c)))
+            w_hi = np.float32(1.0) - w_sh
+            d = d + np.float32(shadow_cmy[ch]) * w_sh + np.float32(highlight_cmy[ch]) * w_hi
 
         # Zone Density: mid-sparing brightness offsets, using the print path's own kernel and
         # weights (logic.py, "Zone Density (ΔD)"). Positive adds density, so it darkens: the
@@ -262,7 +399,31 @@ def apply_transfer_curve(
         if shoulder[ch] != 0.0:
             d = d + np.float32(shoulder[ch]) * _softplus(np.float32(sh_knee) - d, sw3[ch])
 
-        out[:, :, ch] = np.power(np.float32(10.0), -d, dtype=np.float32)
+        dens[:, :, ch] = d
+
+    sep_k3 = per_channel_dye_separation(separation, separation_trims)
+    if sep_k3 != (1.0, 1.0, 1.0):
+        # M(k) = diag(k) + (1-k)*J (papers.resolve_saturation_matrix): each channel
+        # scales its own deviation from the frame's mean density by its own k, since
+        # this curve has no paper base to measure above and no dye matrix to fold the
+        # per-layer trims into instead.
+        mean = dens.mean(axis=2, keepdims=True)
+        e = dens - mean
+        if damping > 0.0:
+            # Separation Damping makes each channel's k chroma-dependent per pixel, from
+            # the same chroma but each channel's own k (see separation_damping_gain_np).
+            chroma = np.sqrt(((e[:, :, 0] - e[:, :, 1]) ** 2 + (e[:, :, 1] - e[:, :, 2]) ** 2 + (e[:, :, 0] - e[:, :, 2]) ** 2) / 3.0)
+            ref_spread = float(EXPOSURE_CONSTANTS["separation_damping_ref_spread"])
+            k_eff = np.stack(
+                [separation_damping_gain_np(sep_k3[ch], damping, chroma, ref_spread) for ch in range(3)],
+                axis=2,
+            )
+            dens = mean + k_eff * e
+        else:
+            k3 = np.asarray(sep_k3, dtype=np.float32)
+            dens = mean + k3[np.newaxis, np.newaxis, :] * e
+
+    out = np.power(np.float32(10.0), -dens, dtype=np.float32)
 
     # Baseline and display rendering last, so the controls above shape the scene and this
     # only decides how the scene is shown. A finished positive sits nowhere below a sensor
@@ -284,11 +445,19 @@ def transfer_bounds(density_range: float = TRANSFER_DENSITY_RANGE) -> Tuple[Tupl
     return (0.0, 0.0, 0.0), (-density_range, -density_range, -density_range)
 
 
-def is_transparency_transfer(process_mode: str, e6_normalize: bool, render_intent: Optional[str] = None) -> bool:
-    """Single source of truth for the mode test, so CPU/GPU/UI cannot drift apart."""
+def is_transfer_path(process_mode: str, e6_normalize: bool, positive_source: bool = False, render_intent: Optional[str] = None) -> bool:
+    """Single source of truth for the mode test, so CPU/GPU/UI cannot drift apart.
+
+    True on an as-captured Slide (Normalize off), and on a frame marked Positive: a
+    file already positivized before NegPy saw it -- a scanned print, an export from
+    other software, a negative the scanner inverted itself -- has nothing left to meter
+    or invert. Only a Slide config carries Positive (ProcessConfig.__post_init__); the
+    flag is read here for callers that pass the fields apart."""
     from negpy.features.exposure.models import RenderIntent
     from negpy.features.process.models import ProcessMode
 
     if render_intent == RenderIntent.FLAT:
         return False
-    return process_mode == ProcessMode.E6 and not e6_normalize
+    if process_mode == ProcessMode.E6:
+        return not e6_normalize
+    return positive_source

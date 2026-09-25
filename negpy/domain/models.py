@@ -15,7 +15,7 @@ from negpy.features.geometry.models import (  # noqa: F401  (re-exported: the cr
     canonical_crop_ratio,
 )
 from negpy.features.lab.models import LabConfig
-from negpy.features.local.models import LocalAdjustmentsConfig, LocalMask, MaskShape
+from negpy.features.local.models import LocalAdjustmentsConfig, LocalMask, MaskKey, MaskShape
 from negpy.features.retouch.models import RetouchConfig
 from negpy.features.altprocess.models import AltProcessConfig
 from negpy.features.toning.models import ToningConfig
@@ -196,8 +196,8 @@ class ExportConfig:
     # When True, exports overwrite existing files silently. When False, the export prompts
     # (Overwrite / Rename / Cancel) before clobbering anything.
     overwrite: bool = False
-    output_mode: ExportPresetOutputMode = ExportPresetOutputMode.ABSOLUTE
-    output_subfolder: str = ""
+    output_mode: ExportPresetOutputMode = ExportPresetOutputMode.SUBFOLDER_OF_SOURCE
+    output_subfolder: str = "export"
     icc_input_path: Optional[str] = None
     icc_output_path: Optional[str] = None
 
@@ -386,25 +386,28 @@ class WorkspaceConfig:
     export: ExportConfig = field(default_factory=ExportConfig)
 
     def __post_init__(self) -> None:
-        """A merged bracket never carries the Normalize stretch.
+        """A merged bracket never carries the Normalize stretch or Highlight Reconstruction.
 
-        The two decide the same thing and the merge loses. Normalize meters the buffer and
-        stretches the measured range to full, which divides the render exposure's scale
-        straight back out — moving the anchor then changes nothing at all below the point
-        where its specular stops clipping. They do not want each other either: Normalize
-        rescues faded film, fading *compresses* density range, and a frame whose range
-        collapsed is not one that needed a bracket.
+        The two decide the same thing as a merge and the merge wins. Normalize meters the
+        buffer and stretches the measured range to full, which divides the render exposure's
+        scale straight back out — moving the anchor then changes nothing at all below the
+        point where its specular stops clipping. They do not want each other either:
+        Normalize rescues faded film, fading *compresses* density range, and a frame whose
+        range collapsed is not one that needed a bracket. Reconstruction guesses a clipped
+        pixel's color per frame independently, which the merge's own clip detection would
+        then trust as real signal instead of a genuine highlight recovered from a shorter,
+        unclipped exposure.
 
-        Held here rather than at the render, because e6_normalize is read from
-        `is_transparency_transfer` down through both engines and the sidebars, and a rule
-        applied at some of those is the hidden-but-live trap the Calibration panel already
-        learned. Inert everywhere, from one place.
+        Held here rather than at the render, because both fields are read from
+        `is_transfer_path`/the decode down through both engines and the sidebars,
+        and a rule applied at some of those is the hidden-but-live trap the Calibration
+        panel already learned. Inert everywhere, from one place.
 
         Not a migration: this must hold however the config was built — a merge created now,
         a composite loaded from the DB, a `replace` that turns an ordinary frame into one.
         """
-        if hdr_active(self.hdr) and self.process.e6_normalize:
-            object.__setattr__(self, "process", replace(self.process, e6_normalize=False))
+        if hdr_active(self.hdr) and (self.process.e6_normalize or self.process.highlight_reconstruction):
+            object.__setattr__(self, "process", replace(self.process, e6_normalize=False, highlight_reconstruction=0))
 
     def to_dict(self) -> Dict[str, Any]:
         """
@@ -483,6 +486,10 @@ class WorkspaceConfig:
                         grade=float(m.get("grade", 0.0)),
                         shape=MaskShape(m.get("shape", MaskShape.POLYGON)),
                         invert=bool(m.get("invert", False)),
+                        enabled=bool(m.get("enabled", True)),
+                        key=MaskKey(m.get("key", MaskKey.OFF)),
+                        key_zone=float(m.get("key_zone", 6.0)),
+                        key_softness=float(m.get("key_softness", 1.0)),
                     )
                 )
             return LocalAdjustmentsConfig(masks=tuple(masks))

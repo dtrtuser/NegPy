@@ -15,8 +15,9 @@ from PyQt6.QtWidgets import (
 
 from negpy.desktop.controller import AppController
 from negpy.desktop.view.keyboard_shortcuts import _context_undo
-from negpy.desktop.view.widgets.granular_settings_dialog import open_paste_dialog
+from negpy.desktop.view.widgets.granular_settings_dialog import open_paste_dialog, open_sync_bounds_dialog
 from negpy.desktop.view.shortcut_registry import label_with_shortcut, tooltip_with_shortcut
+from negpy.desktop.view.widgets.collapsible import roll_revert_icon
 from negpy.desktop.view.styles.templates import default_button_height, wrap_tooltip
 from negpy.desktop.view.styles.theme import THEME
 
@@ -259,8 +260,8 @@ class ActionToolbar(QWidget):
         # current canvas width. "More actions" is a stable, complete menu the user can always
         # find everything in, not a residue of the row's responsive collapse. It used to lose
         # entries whenever a side panel toggle gave the row enough width to show them directly.
-        # A checkable item carries no icon. Under the app stylesheet Qt draws a menu icon in
-        # the check column, and the checkmark is the only thing that says the view is on.
+        # A checkable item carries no icon: the stylesheet puts a menu icon in the check
+        # column, which hides the checkmark that says the view is on.
         self._ov_hq_action = overflow_menu.addAction("Toggle HQ Preview")
         self._ov_hq_action.setCheckable(True)
         self._tip(self._ov_hq_action, "Toggle high-quality (full-resolution) preview", "toggle_hq")
@@ -290,6 +291,14 @@ class ActionToolbar(QWidget):
             self._ov_negative_peek_action,
             "Peek negative — show the source as it was loaded, un-inverted and unedited, at your crop and rotation (no color management)",
             "toggle_negative_peek",
+        )
+        self._ov_embedded_peek_action = overflow_menu.addAction("Peek Embedded Preview")
+        self._ov_embedded_peek_action.setCheckable(True)
+        self._ov_embedded_peek_action.setToolTip(
+            tooltip_with_shortcut(
+                "Peek embedded preview — the camera's own JPEG of this capture, as a reference for what the scan looks like",
+                "toggle_embedded_peek",
+            )
         )
         self._ov_zones_action = overflow_menu.addAction("Zone Overlay")
         self._ov_zones_action.setCheckable(True)
@@ -337,11 +346,24 @@ class ActionToolbar(QWidget):
         )
         self._label(self._action_paste, "Paste Settings", "paste")
         self._action_paste.setToolTip("Paste the copied settings onto this image")
+        self._action_sync_bounds = overflow_menu.addAction(
+            qta.icon("fa5s.crosshairs", color=icon_color),
+            "Sync Bounds…",
+            lambda: open_sync_bounds_dialog(self, self.session),
+        )
+        self._label(self._action_sync_bounds, "Sync Bounds…", "sync_bounds")
+        self._action_sync_bounds.setToolTip("Give other frames this image's metering bounds, and nothing else")
         overflow_menu.addSeparator()
         reset_settings_action = overflow_menu.addAction(
             qta.icon("fa5s.history", color=icon_color), "Reset Settings", self.session.reset_settings
         )
         reset_settings_action.setToolTip("Discard all edits and return this image to its default look")
+        self._action_reset_to_roll = overflow_menu.addAction(
+            roll_revert_icon(icon_color), "Reset to Roll Settings", self.controller.revert_frame_to_roll
+        )
+        self._label(self._action_reset_to_roll, "Reset to Roll Settings", "reset_to_roll")
+        self._action_reset_to_roll.setToolTip("Return every card that differs from the roll to the roll's settings")
+        overflow_menu.aboutToShow.connect(lambda: self._action_reset_to_roll.setEnabled(self.controller.can_revert_frame_to_roll()))
         overflow_menu.addSeparator()
         unload_action = overflow_menu.addAction(qta.icon("fa5s.times-circle", color=icon_color), "Unload…", self._on_overflow_unload)
         unload_action.setToolTip("Remove this image from the session (its saved edit is kept)")
@@ -448,6 +470,11 @@ class ActionToolbar(QWidget):
             widget.setChecked(active)
             widget.blockSignals(False)
 
+    def _on_embedded_peek_changed(self, active: bool) -> None:
+        self._ov_embedded_peek_action.blockSignals(True)
+        self._ov_embedded_peek_action.setChecked(active)
+        self._ov_embedded_peek_action.blockSignals(False)
+
     def _connect_signals(self) -> None:
         self.btn_prev.clicked.connect(self.session.prev_file)
         self.btn_next.clicked.connect(self.session.next_file)
@@ -472,6 +499,8 @@ class ActionToolbar(QWidget):
         self.btn_negative_peek.toggled.connect(lambda checked: self.controller.toggle_negative_peek(force=checked))
         self._ov_negative_peek_action.triggered.connect(lambda checked: self.controller.toggle_negative_peek(force=checked))
         self.controller.negative_peek_changed.connect(self._on_negative_peek_changed)
+        self._ov_embedded_peek_action.triggered.connect(lambda checked: self.controller.toggle_embedded_peek(force=checked))
+        self.controller.embedded_peek_changed.connect(self._on_embedded_peek_changed)
         self.btn_zones.toggled.connect(lambda checked: self.controller.toggle_zones_overlay(force=checked))
         self._ov_zones_action.triggered.connect(lambda checked: self.controller.toggle_zones_overlay(force=checked))
         self.controller.zones_overlay_changed.connect(self._on_zones_changed)
@@ -529,56 +558,59 @@ class ActionToolbar(QWidget):
     def rotate(self, direction: int) -> None:
         from dataclasses import replace
 
-        from negpy.features.geometry.logic import rotate_normalized_rect
+        from negpy.features.geometry.logic import rotate_geometry_and_analysis
 
         # A proof on the canvas takes the rotation instead of the image. Must precede the
         # handedness fix below, which is geometry-only.
         if self.controller.rotate_test_strip(direction):
             return
 
-        config = self.session.state.config
-        geo = config.geometry
-        # The button's labelled direction is the visual rotation the user sees, and the handedness
-        # fix below only keeps that promise under a flip. Crop and analysis rects live in display
-        # space, so they rotate by that visual quarter-turn.
-        visual_turns_ccw = direction
-        # Pipeline applies rotate-then-flip; a single mirror inverts rotation handedness.
-        if geo.flip_horizontal != geo.flip_vertical:
-            direction = -direction
-        new_rot = (geo.rotation + direction) % 4
-        new_geo = replace(geo, rotation=new_rot)
-        # Rotate the manual crop rect with the content so it keeps framing the same area. Without
-        # this it stayed put and misaligned after a quarter or half turn.
-        if geo.crop_rect is not None:
-            new_geo = replace(new_geo, crop_rect=rotate_normalized_rect(geo.crop_rect, visual_turns_ccw))
-        new_config = replace(config, geometry=new_geo)
-        # The freehand analysis region is display-space too; rotate it alongside.
-        if config.process.analysis_rect is not None:
-            new_rect = rotate_normalized_rect(config.process.analysis_rect, visual_turns_ccw)
-            new_config = replace(new_config, process=replace(config.process, analysis_rect=new_rect))
-        self.session.update_config(new_config, persist=True)
-        # Rotating must not drop an active before/after or flat-peek, so re-render in place within
-        # whichever view is on.
-        self.controller.rerender_active_view()
+        state = self.session.state
+        # A multi-selection that has explicitly excluded the active frame (ctrl-click
+        # toggled it off) must not rotate it anyway: selection wins over "what's on
+        # screen" once there is one, the same rule toggle_mark already uses.
+        include_active = len(state.selected_indices) <= 1 or state.selected_file_idx in state.selected_indices
+        if include_active:
+            config = state.config
+            new_geo, new_rect = rotate_geometry_and_analysis(config.geometry, config.process.analysis_rect, direction)
+            new_config = replace(config, geometry=new_geo)
+            if config.process.analysis_rect is not None:
+                new_config = replace(new_config, process=replace(config.process, analysis_rect=new_rect))
+            self.session.update_config(new_config, persist=True)
+        # A multi-selection rotates every other selected frame too, each by its own
+        # current geometry rather than a copy of the active frame's new one.
+        touched = self.session.rotate_selected_frames(direction, active_included=include_active)
+        if touched:
+            self.controller.rotate_thumbnails(touched, direction)
+        if include_active:
+            # Rotating must not drop an active before/after or flat-peek, so re-render in
+            # place within whichever view is on.
+            self.controller.rerender_active_view()
 
     def flip(self, axis: str) -> None:
         from dataclasses import replace
 
-        from negpy.features.geometry.logic import mirror_normalized_rect, toggle_flip
+        from negpy.features.geometry.logic import flip_geometry_and_analysis
 
         horizontal = axis == "horizontal"
-        config = self.session.state.config
-        # toggle_flip negates fine rotation and mirrors the crop rect, so the result is a true
-        # mirror of the current render (see its docstring).
-        new_config = replace(config, geometry=toggle_flip(config.geometry, horizontal))
-        # The freehand analysis region is transformed-space like the crop rect, so mirroring it
-        # keeps the meters reading the same picture content.
-        if config.process.analysis_rect is not None:
-            new_rect = mirror_normalized_rect(config.process.analysis_rect, horizontal)
-            new_config = replace(new_config, process=replace(config.process, analysis_rect=new_rect))
-        self.session.update_config(new_config, persist=True)
-        # Flipping shouldn't drop an active before/after or flat-peek (see rotate()).
-        self.controller.rerender_active_view()
+        state = self.session.state
+        # See rotate(): a multi-selection that excludes the active frame skips it too.
+        include_active = len(state.selected_indices) <= 1 or state.selected_file_idx in state.selected_indices
+        if include_active:
+            config = state.config
+            new_geo, new_rect = flip_geometry_and_analysis(config.geometry, config.process.analysis_rect, horizontal)
+            new_config = replace(config, geometry=new_geo)
+            if config.process.analysis_rect is not None:
+                new_config = replace(new_config, process=replace(config.process, analysis_rect=new_rect))
+            self.session.update_config(new_config, persist=True)
+        # A multi-selection flips every other selected frame too, each by its own
+        # current geometry rather than a copy of the active frame's new one.
+        touched = self.session.flip_selected_frames(horizontal, active_included=include_active)
+        if touched:
+            self.controller.flip_thumbnails(touched, horizontal)
+        if include_active:
+            # Flipping shouldn't drop an active before/after or flat-peek (see rotate()).
+            self.controller.rerender_active_view()
 
     def _show_tour(self) -> None:
         from negpy.desktop.view.main_window import MainWindow

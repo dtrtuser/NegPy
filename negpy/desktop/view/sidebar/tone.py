@@ -6,6 +6,7 @@ from negpy.desktop.view.sidebar.base import BaseSidebar
 from negpy.desktop.view.styles.templates import ICON_BUTTON_WIDTH, section_subheader, wrap_tooltip
 from negpy.desktop.view.styles.theme import THEME
 from negpy.desktop.view.widgets.sliders import CompactSlider
+from negpy.features.exposure.logic import per_channel_dye_separation
 from negpy.features.exposure.models import EXPOSURE_CONSTANTS, TUNABLE_TARGETS, apply_targets
 
 _CH_SUFFIX = ("red", "green", "blue")
@@ -337,6 +338,9 @@ class ToneSidebar(BaseSidebar):
         self.controller.test_strip_changed.connect(self._sync_test_strip_btn)
         self.ch_btn_group.idToggled.connect(lambda _id, checked: self.sync_ui() if checked else None)
 
+        # White Point/Black Point live on ProcessConfig, not ExposureConfig like the rest of
+        # this panel, so they write to a different config section than the loop below.
+
         for slider, field in (
             (self.density_slider, "density"),
             (self.grade_slider, "grade"),
@@ -428,34 +432,34 @@ class ToneSidebar(BaseSidebar):
             self.paper_combo.setCurrentIndex(paper_idx if paper_idx >= 0 else 0)
             self.paper_combo.setVisible(mode != ProcessMode.E6)
 
-            # Transparency transfer (E-6, Normalize off): the render starts from the capture instead
-            # of printing it, so the paper model and the automatic grading that decides a look have
-            # nothing to act on. Density, Grade, Toe and Shoulder stay, because they drive the
-            # transfer curve (see features/exposure/transfer.py).
-            from negpy.features.exposure.transfer import is_transparency_transfer
+            # On the transfer path (an as-captured Slide, or any Positive frame) the render
+            # starts from the capture, so the paper model has nothing to act on. Density,
+            # Grade, Toe and Shoulder drive the transfer curve instead (exposure/transfer.py).
+            from negpy.features.exposure.transfer import is_transfer_path
 
-            transfer = is_transparency_transfer(mode, self.state.config.process.e6_normalize, conf.render_intent)
+            proc = self.state.config.process
+            transfer = is_transfer_path(mode, proc.e6_normalize, proc.positive_source, conf.render_intent)
             # Shadows and Highlights Density stay live on the transfer path: the curve implements
             # Zone Density with the print's own weights, and they are the only controls there that
             # open shadows without moving the whole scale. Split Grade does not, because it rotates
             # contrast about the same centres and the transfer curve has no per-zone slope to rotate.
             for w in (
-                self.auto_density_btn,
-                self.auto_grade_btn,
                 self.paper_dmin_btn,
                 self.paper_black_btn,
                 self.midtone_gamma_slider,
                 self.shadow_grade_slider,
                 self.highlight_grade_slider,
-                self.dye_separation_slider,
-                self.dye_separation_trim_slider,
-                self.separation_damping_slider,
                 # The transfer curve takes no dodge/burn map, and the mask rides it.
                 self.contrast_mask_slider,
                 self.mask_spacer_slider,
             ):
                 w.setVisible(not transfer)
-
+            # Auto Density and Auto Grade meter the frame to pick a look, which a raw
+            # un-normalized slide exists to avoid for a deliberate exposure. A Positive
+            # frame has no such bracket to protect, so they run (transfer_auto_terms).
+            auto_hidden = transfer and not proc.positive_source
+            for w in (self.auto_density_btn, self.auto_grade_btn):
+                w.setVisible(not auto_hidden)
             # Per-layer trims are meaningless on a single-emulsion B&W paper.
             is_bw = mode == ProcessMode.BW
             if is_bw and self._channel_index() != 0:
@@ -472,9 +476,13 @@ class ToneSidebar(BaseSidebar):
             self.toe_w_trim_slider.setVisible(not global_mode)
             self.sh_w_slider.setVisible(global_mode)
             self.sh_w_trim_slider.setVisible(not global_mode)
-            self.dye_separation_slider.setVisible(global_mode and not is_bw and not transfer)
-            self.dye_separation_trim_slider.setVisible(not global_mode and not is_bw and not transfer)
-            self.separation_damping_slider.setVisible(global_mode and not is_bw and not transfer)
+            # Dye Separation swaps the same way on both paths: the global slider in the
+            # global view, the per-channel trim in a channel tab (see
+            # features/exposure/transfer.py). Separation Damping has no per-channel
+            # trim of its own, so it stays global-view-only on both paths too.
+            self.dye_separation_slider.setVisible(global_mode and not is_bw)
+            self.dye_separation_trim_slider.setVisible(not global_mode and not is_bw)
+            self.separation_damping_slider.setVisible(global_mode and not is_bw)
             self.toe_slider.label.setText("Toe" + suffix)
             self.sh_slider.label.setText("Shoulder" + suffix)
             self.midtone_gamma_slider.label.setText("Snap" + suffix)
@@ -506,7 +514,6 @@ class ToneSidebar(BaseSidebar):
 
             for btn, fields in self._channel_buttons:
                 btn.edited_dot.set_active(any(getattr(conf, f) != 0.0 for f in fields))
-
             self.density_slider.setValue(conf.density)
             self.grade_slider.setValue(conf.grade)
             self.toe_w_slider.setValue(conf.toe_width)
@@ -520,8 +527,13 @@ class ToneSidebar(BaseSidebar):
             # Out of _global_only: that tuple means enabled exactly when global.
             self.mask_spacer_slider.setEnabled(global_mode and conf.contrast_mask != 0.0)
             # It redistributes Dye Separation's push and does nothing on its own, so at 1.0
-            # separation it is dead. Say so instead of letting it be dragged for no result.
-            self.separation_damping_slider.setEnabled(conf.dye_separation != 1.0)
+            # separation on every channel it is dead — a per-channel trim also arms it,
+            # not just the global value. Say so instead of letting it be dragged for no result.
+            sep_k3 = per_channel_dye_separation(
+                conf.dye_separation,
+                (conf.dye_separation_trim_red, conf.dye_separation_trim_green, conf.dye_separation_trim_blue),
+            )
+            self.separation_damping_slider.setEnabled(sep_k3 != (1.0, 1.0, 1.0))
 
             self.paper_dmin_btn.setChecked(conf.paper_dmin)
             self.paper_black_btn.setChecked(conf.paper_black)

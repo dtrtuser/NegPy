@@ -98,21 +98,32 @@ def _fmt_gear(values: tuple) -> str:
 
 # fmt: off
 CATALOG: list[tuple[str, tuple[SettingRow, ...]]] = [
-    ("Process", (
-        _row("Mode", "process", "process_mode", sticky=True),
+    ("Film Mode", (
+        _row("Film Mode", "process", "process_mode", sticky=True),
+        _row("Normalize", "process", "e6_normalize", sticky=True),
         _row("Positive", "process", "positive_source", sticky=True),
+    )),
+    ("Metering", (
         _row("Analysis Buffer", "process", "analysis_buffer", sticky=True),
-        _row("Range", "process", "luma_range_clip", sticky=True),
-        _row("Color", "process", "color_range_clip", sticky=True),
+        _row("Luma Range Clip", "process", "luma_range_clip", sticky=True),
+        _row("Color Clip", "process", "color_range_clip", sticky=True),
         _row("White Point", "process", "white_point_offset"),
-        _row("White Trim", "process", "white_point_trim_red", "white_point_trim_green", "white_point_trim_blue", channels="RGB"),
+        _row("White Point Trim", "process", "white_point_trim_red", "white_point_trim_green", "white_point_trim_blue", channels="RGB"),
         _row("Black Point", "process", "black_point_offset"),
-        _row("Black Trim", "process", "black_point_trim_red", "black_point_trim_green", "black_point_trim_blue", channels="RGB"),
+        _row("Black Point Trim", "process", "black_point_trim_red", "black_point_trim_green", "black_point_trim_blue", channels="RGB"),
+    )),
+    ("Roll Analysis", (
+        _row("Use Average Luma", "process", "use_luma_average"),
+        _row("Use Average Color", "process", "use_color_average"),
+        # The axis travels with the toggle: the toggle alone reads a baseline the target may not have.
+        _row("Use Average Cast", "process", "use_cast_average", "locked_neutral_axis", fmt=lambda v: _fmt_scalar(v[0])),
+    )),
+    ("Calibration", (
         # Strength, profile and the baked matrix copy atomically: strength alone would leave the
         # target on a stale or None matrix.
         _row("Crosstalk", "process", "crosstalk_strength", "crosstalk_profile", "crosstalk_matrix", fmt=lambda v: _fmt_scalar(v[0]), sticky=True),
         _row("Single-Shot Narrowband Calibration", "process", "sensor_profile", "sensor_matrix", fmt=lambda v: _fmt_scalar(v[0]), sticky=True),
-        # Absent from _BOUNDS_INPUT_FIELDS: it acts after inversion, so it never feeds the meters.
+        # Absent from BOUNDS_INPUT_FIELDS: it acts after inversion, so it never feeds the meters.
         _row("Hue Trim", "process", "hue_trim", sticky=True),
     )),
     ("Crop", (
@@ -125,21 +136,24 @@ CATALOG: list[tuple[str, tuple[SettingRow, ...]]] = [
         # detected on the target.
         _row("Crop", "geometry", "crop_rect", "crop_detect_key", fmt=lambda v: _fmt_scalar(v[0])),
     )),
-    ("Rotation", (
+    ("Geometry", (
         _row("Rotation", "geometry", "rotation"),
         _row("Fine Rotation", "geometry", "fine_rotation"),
-        _row("Easel Tilt", "geometry", "converge_v"),
-        _row("Easel Swing", "geometry", "converge_h"),
-    _row("Distortion Correction", "geometry", "distortion_k1", sticky=True),
+        _row("Tilt", "geometry", "converge_v"),
+        _row("Swing", "geometry", "converge_h"),
         _row("Flip Horizontal", "geometry", "flip_horizontal", sticky=True),
         _row("Flip Vertical", "geometry", "flip_vertical", sticky=True),
+    )),
+    ("Optics", (
+        _row("Distortion Correction", "geometry", "distortion_k1", "lens_distortion_from_metadata", sticky=True),
+        _row("Embedded CA", "geometry", "lens_ca_from_metadata", sticky=True),
     )),
     ("Tone", (
         _row("Print Density", "exposure", "density"),
         _row("ISO-R Grade", "exposure", "grade"),
         _row("Grade Trim", "exposure", "grade_trim_red", "grade_trim_green", "grade_trim_blue", channels="RGB"),
         _row("Paper Black", "exposure", "paper_black", sticky=True),
-        _row("Paper Dmin", "exposure", "paper_dmin", sticky=True),
+        _row("Paper White", "exposure", "paper_dmin", sticky=True),
         _row("Shadows Density", "exposure", "shadow_density"),
         _row("Highlights Density", "exposure", "highlight_density"),
         _row("Shadows Grade", "exposure", "shadow_grade"),
@@ -161,16 +175,16 @@ CATALOG: list[tuple[str, tuple[SettingRow, ...]]] = [
         _row("Separation Damping", "exposure", "separation_damping"),
         _row("Contrast Mask", "exposure", "contrast_mask"),
         _row("Mask Spacer", "exposure", "mask_spacer"),
-        _row("Auto Exposure", "exposure", "auto_exposure", sticky=True),
-        _row("Auto Contrast", "exposure", "auto_normalize_contrast", sticky=True),
+        _row("Auto Density", "exposure", "auto_exposure", sticky=True),
+        _row("Auto Grade", "exposure", "auto_normalize_contrast", sticky=True),
         _row("Paper Profile", "exposure", "paper_profile", sticky=True),
     )),
-    ("Color", (
+    ("Filtration", (
         _row("Cyan", "exposure", "wb_cyan"),
         _row("Magenta", "exposure", "wb_magenta"),
         _row("Yellow", "exposure", "wb_yellow"),
-        _row("Shadow CMY", "exposure", "shadow_cyan", "shadow_magenta", "shadow_yellow", channels="CMY"),
-        _row("Highlight CMY", "exposure", "highlight_cyan", "highlight_magenta", "highlight_yellow", channels="CMY"),
+        _row("Shadows CMY", "exposure", "shadow_cyan", "shadow_magenta", "shadow_yellow", channels="CMY"),
+        _row("Highlights CMY", "exposure", "highlight_cyan", "highlight_magenta", "highlight_yellow", channels="CMY"),
         _row("Cast Removal", "exposure", "cast_removal_strength", sticky=True),
     )),
     ("Lab", (
@@ -179,8 +193,8 @@ CATALOG: list[tuple[str, tuple[SettingRow, ...]]] = [
         _row("CLAHE", "lab", "clahe_strength", sticky=True),
         _row("Sharpening", "lab", "sharpen", sticky=True),
         _row("Sharpen Method", "lab", "sharpen_method", sticky=True),
-        _row("Radius", "lab", "sharpen_radius", sticky=True),
-        _row("Masking", "lab", "sharpen_masking", sticky=True),
+        _row("Sharpen Radius", "lab", "sharpen_radius", sticky=True),
+        _row("Sharpen Masking", "lab", "sharpen_masking", sticky=True),
         _row("Chroma Denoise", "lab", "chroma_denoise", sticky=True),
         _row("Glow", "lab", "glow_amount", sticky=True),
         _row("Halation", "lab", "halation_strength", sticky=True),
@@ -208,7 +222,7 @@ CATALOG: list[tuple[str, tuple[SettingRow, ...]]] = [
         _row("Highlight Hue", "toning", "highlight_tint_hue"),
         _row("Highlight Strength", "toning", "highlight_tint_strength"),
     )),
-    ("Finish", (
+    ("Finishing", (
         _row("Vignette Burn", "finish", "vignette_stops"),
         _row("Vignette Size", "finish", "vignette_size"),
         _row("Vignette Roundness", "finish", "vignette_roundness"),
@@ -219,19 +233,19 @@ CATALOG: list[tuple[str, tuple[SettingRow, ...]]] = [
         _row("Border Width", "finish", "border_size"),
         _row("Border Color", "finish", "border_color"),
         _row("Border Bottom Weight", "finish", "border_bottom_weight"),
-        _row("Border Match Paper", "finish", "border_match_paper"),
+        _row("Border Paper White", "finish", "border_match_paper"),
     )),
     ("Retouch", (
-        _row("Dust Removal", "retouch", "dust_remove", sticky=True),
-        _row("Dust Threshold", "retouch", "dust_threshold"),
-        _row("Dust Size", "retouch", "dust_size"),
+        _row("Optical Removal", "retouch", "dust_remove", sticky=True),
+        _row("Optical Threshold", "retouch", "dust_threshold"),
+        _row("Optical Size", "retouch", "dust_size"),
         _row("IR Removal", "retouch", "ir_dust_remove"),
         _row("IR Threshold", "retouch", "ir_threshold"),
         _row("IR Method", "retouch", "ir_method"),
         _row("IR Attenuation", "retouch", "ir_attenuation"),
     )),
     ("Metadata", (
-        _row("Gear", "metadata", *GEAR_FIELDS, fmt=_fmt_gear),
+        _row("Analog Gear", "metadata", *GEAR_FIELDS, fmt=_fmt_gear),
         _row("Capture Date", "metadata", "capture_date"),
         _row(
             "Place",
@@ -247,8 +261,8 @@ CATALOG: list[tuple[str, tuple[SettingRow, ...]]] = [
         _row("Scanning", "metadata", *SCANNING_FIELDS, fmt=lambda v: _fmt_scalar(v[0])),
         # capture_frame is deliberately absent: a frame number is unique to one frame.
         _row("Roll", "metadata", "capture_roll"),
-        _row("Exposure Override", "metadata", "exposure_override"),
-        _row("Sync To Batch", "metadata", "sync_to_batch"),
+        _row("Exposure", "metadata", "exposure_override"),
+        _row("Sync Metadata to Batch", "metadata", "sync_to_batch"),
         _row("Protect Original Metadata", "metadata", "protect_original_metadata", sticky=True),
         _row(
             "Description Fields",
@@ -271,16 +285,16 @@ CATALOG: list[tuple[str, tuple[SettingRow, ...]]] = [
         _row("WebP Quality", "export", "webp_quality", sticky=True),
         _row("WebP Lossless", "export", "webp_lossless", sticky=True),
         _row("WebP Method", "export", "webp_method", sticky=True),
-        _row("Resolution Mode", "export", "export_resolution_mode", sticky=True),
-        _row("Aspect Ratio", "export", "paper_aspect_ratio", sticky=True),
+        _row("Size Mode", "export", "export_resolution_mode", sticky=True),
+        _row("Paper Ratio", "export", "paper_aspect_ratio", sticky=True),
         _row("Print Size", "export", "export_print_size", sticky=True),
         _row("DPI", "export", "export_dpi", sticky=True),
-        _row("Target Long Edge", "export", "export_target_long_edge_px", sticky=True),
-        _row("Export profile", "export", "export_color_space", sticky=True),
+        _row("Long Edge", "export", "export_target_long_edge_px", sticky=True),
+        _row("Export Profile", "export", "export_color_space", sticky=True),
         _row("Filename Pattern", "export", "filename_pattern", sticky=True),
-        _row("Overwrite", "export", "overwrite", sticky=True),
-        _row("Output Mode", "export", "output_mode", sticky=True),
-        _row("Sidecars", "export", "export_sidecars_enabled", sticky=True),
+        _row("Overwrite Existing Files", "export", "overwrite", sticky=True),
+        _row("Output Intent", "export", "output_mode", sticky=True),
+        _row("Save Sidecars on Export", "export", "export_sidecars_enabled", sticky=True),
     )),
 ]
 # fmt: on
@@ -292,12 +306,15 @@ _DEFAULT = WorkspaceConfig()
 # value never reaches the render. Mirrors what every sidebar handler for these already
 # does. Excluded on purpose: autocrop_ratio (see AppController.set_crop_ratio), rotation,
 # and the white and black points, which apply after the bounds rather than feeding them.
-_BOUNDS_INPUT_FIELDS = frozenset(
+BOUNDS_INPUT_FIELDS = frozenset(
     {
         "process_mode",
         "analysis_buffer",
         "luma_range_clip",
         "color_range_clip",
+        "use_luma_average",
+        "use_color_average",
+        "e6_normalize",
         "crosstalk_strength",
         "crosstalk_profile",
         "crosstalk_matrix",
@@ -319,6 +336,126 @@ def all_rows() -> list[SettingRow]:
 
 def rows_by_id() -> dict[str, SettingRow]:
     return {r.id: r for r in all_rows()}
+
+
+def rows_for_fields(fields: Iterable[str]) -> list[SettingRow]:
+    """Every row touching one of *fields*. Any overlap counts, because a row travels
+    whole: Crosstalk has to come along on its strength field alone, or the matrix it
+    carries is left behind."""
+    wanted = set(fields)
+    return [r for r in all_rows() if any(f in wanted for f in r.fields)]
+
+
+def section_of_field() -> dict[str, str]:
+    """field name -> the WorkspaceConfig section it lives on, over every catalog row."""
+    return {f: r.section for r in all_rows() for f in r.fields}
+
+
+def rows_for_section(section: str) -> list[SettingRow]:
+    """Every row on one WorkspaceConfig section, for a card that owns the whole of it."""
+    return [r for r in all_rows() if r.section == section]
+
+
+# Exposure field partitions: the Filtration and Tone sections split ExposureConfig, for
+# both per-section modified counts and scoped resets. render_intent is in neither, since
+# it is flat-master output.
+COLOR_FIELDS = (
+    "wb_cyan",
+    "wb_magenta",
+    "wb_yellow",
+    "shadow_cyan",
+    "shadow_magenta",
+    "shadow_yellow",
+    "highlight_cyan",
+    "highlight_magenta",
+    "highlight_yellow",
+    "cast_removal_strength",
+)
+
+GEOMETRY_FIELDS = (
+    "rotation",
+    "fine_rotation",
+    "flip_horizontal",
+    "flip_vertical",
+    "converge_v",
+    "converge_h",
+    "crop_to_valid",
+    "crop_rect",
+    "crop_from_auto",
+    "crop_detect_key",
+)
+
+TONE_FIELDS = (
+    "density",
+    "grade",
+    "grade_trim_red",
+    "grade_trim_green",
+    "grade_trim_blue",
+    "paper_black",
+    "shadow_density",
+    "highlight_density",
+    "shadow_grade",
+    "highlight_grade",
+    "shadow_grade_trim_red",
+    "shadow_grade_trim_green",
+    "shadow_grade_trim_blue",
+    "highlight_grade_trim_red",
+    "highlight_grade_trim_green",
+    "highlight_grade_trim_blue",
+    "paper_dmin",
+    "auto_exposure",
+    "auto_normalize_contrast",
+    "paper_profile",
+    "midtone_gamma",
+    "midtone_gamma_trim_red",
+    "midtone_gamma_trim_green",
+    "midtone_gamma_trim_blue",
+    "toe",
+    "toe_width",
+    "toe_trim_red",
+    "toe_trim_green",
+    "toe_trim_blue",
+    "toe_width_trim_red",
+    "toe_width_trim_green",
+    "toe_width_trim_blue",
+    "shoulder",
+    "shoulder_width",
+    "shoulder_trim_red",
+    "shoulder_trim_green",
+    "shoulder_trim_blue",
+    "shoulder_width_trim_red",
+    "shoulder_width_trim_green",
+    "shoulder_width_trim_blue",
+    "dye_separation",
+    "dye_separation_trim_red",
+    "dye_separation_trim_green",
+    "dye_separation_trim_blue",
+    "separation_damping",
+    "contrast_mask",
+    "mask_spacer",
+)
+
+# Frame cards whose settings can be pushed to other frames, and the fields each owns. A
+# card keyed by its own config section needs no tuple. Roll-tab cards drive roll defaults
+# instead, and Dodge & Burn has no catalog row: a mask means nothing on the next frame.
+FRAME_CARD_FIELDS: dict[str, tuple | None] = {
+    "geometry": GEOMETRY_FIELDS,
+    "color": COLOR_FIELDS,
+    "tone": TONE_FIELDS,
+    "lab": None,
+    "altproc": None,
+    "toning": None,
+    "retouch": None,
+    "finish": None,
+}
+
+
+def frame_card_rows(card_key: str) -> list[SettingRow]:
+    """A frame card's catalog rows: its own field tuple, or its whole config section."""
+    fields = FRAME_CARD_FIELDS.get(card_key, ())
+    if fields is None:
+        return rows_for_section(card_key)
+    return rows_for_fields(fields) if fields else []
 
 
 # Everything but the Metadata rows, for the pickers that offer metadata alone.
@@ -367,7 +504,7 @@ def apply_selected_fields(source: WorkspaceConfig, target: WorkspaceConfig, rows
     out = target
     for section, changes in by_section.items():
         out = replace(out, **{section: replace(getattr(out, section), **changes)})
-    if any(f in _BOUNDS_INPUT_FIELDS for row in rows for f in row.fields):
+    if any(f in BOUNDS_INPUT_FIELDS for row in rows for f in row.fields):
         out = replace(out, process=replace(out.process, **invalidate_local_bounds(out.process)))
     return out
 

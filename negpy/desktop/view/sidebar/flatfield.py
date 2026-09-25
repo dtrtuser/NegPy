@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
 
 from negpy.desktop.view.confirm import confirm_delete_named
 from negpy.desktop.view.sidebar.base import BaseSidebar
-from negpy.desktop.view.styles.templates import field_label, hint_label
+from negpy.desktop.view.styles.templates import ICON_BUTTON_WIDTH, field_label, hint_label
 from negpy.desktop.view.widgets.file_dialogs import last_open_folder, pick_start_dir
 
 _NONE_LABEL = "— None —"
@@ -21,7 +21,8 @@ _FILE_FILTER = "Reference images (*.dng *.tif *.tiff *.cr2 *.cr3 *.nef *.arw *.r
 class FlatFieldSidebar(BaseSidebar):
     """
     Flat-field / falloff correction. Manages named reference profiles (the bare
-    light-source scan) and a per-image enable toggle.
+    light-source scan); the profile and the toggle are roll-wide, since one roll is
+    scanned under one light.
     """
 
     def _init_ui(self) -> None:
@@ -31,6 +32,15 @@ class FlatFieldSidebar(BaseSidebar):
         self.profile_combo.setToolTip("Saved flat-field reference profiles (scan of the bare light source)")
         row.addWidget(self.profile_combo, 1)
 
+        self.enable_btn = self._small_toggle(
+            "fa5s.lightbulb",
+            "",
+            False,
+            "Apply Flat Field — apply the selected flat-field reference to this roll",
+        )
+        self.enable_btn.setFixedWidth(ICON_BUTTON_WIDTH)
+        row.addWidget(self.enable_btn)
+
         self.add_btn = self._icon_action("fa5s.plus", "Pick a reference image and save it as a named profile")
         self.delete_btn = self._icon_action("fa5s.trash", "Remove the selected profile")
         row.addWidget(self.add_btn)
@@ -39,14 +49,6 @@ class FlatFieldSidebar(BaseSidebar):
 
         self.hint = hint_label("Add a scan of the bare light source to enable.")
         self.layout.addWidget(self.hint)
-
-        self.enable_btn = self._small_toggle(
-            "fa5s.lightbulb",
-            "Apply Flat Field",
-            False,
-            "Apply the active flat-field reference to this image",
-        )
-        self.layout.addWidget(self.enable_btn)
 
         self.layout.addStretch()
         self._refresh_profiles()
@@ -73,8 +75,7 @@ class FlatFieldSidebar(BaseSidebar):
 
     def _on_profile_selected(self, _idx: int) -> None:
         profile_id = self.profile_combo.currentData() or ""
-        active = self.controller.session.repo.get_global_setting("flatfield_active_profile") or ""
-        if profile_id == active:
+        if profile_id == self.state.config.flatfield.profile_id:
             return
         self.controller.set_active_flatfield_profile(profile_id)
         self.sync_ui()
@@ -111,12 +112,11 @@ class FlatFieldSidebar(BaseSidebar):
 
     def sync_ui(self) -> None:
         conf = self.state.config.flatfield
-        active = self.controller.session.repo.get_global_setting("flatfield_active_profile") or ""
 
         self.block_signals(True)
         try:
             self._refresh_profiles()
-            idx = self.profile_combo.findData(active)
+            idx = self.profile_combo.findData(conf.profile_id)
             self.profile_combo.setCurrentIndex(idx if idx >= 0 else 0)
 
             self.enable_btn.setChecked(conf.apply)

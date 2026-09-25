@@ -10,11 +10,23 @@ def _combo_items(combo):
     return [(combo.itemText(i), combo.itemData(i)) for i in range(combo.count())]
 
 
+def _row_index_containing(layout, widget) -> int:
+    """Index within *layout* of the (possibly nested) row that directly holds *widget*."""
+    for i in range(layout.count()):
+        item = layout.itemAt(i)
+        if item.widget() is widget:
+            return i
+        row = item.layout()
+        if row is not None and any(row.itemAt(j).widget() is widget for j in range(row.count())):
+            return i
+    raise AssertionError(f"{widget} not found in layout")
+
+
 def test_tone_reset_covers_dye_separation():
-    """The section header's reset button resets the fields listed in _TONE_FIELDS, so
+    """The section header's reset button resets the fields listed in TONE_FIELDS, so
     every control the panel shows has to be in it — a renamed field that falls out of
     the list leaves a visible slider its own reset can't clear."""
-    from negpy.desktop.view.sidebar.controls_panel import _TONE_FIELDS
+    from negpy.desktop.settings_catalog import TONE_FIELDS
 
     for field in (
         "dye_separation",
@@ -23,7 +35,7 @@ def test_tone_reset_covers_dye_separation():
         "dye_separation_trim_blue",
         "separation_damping",
     ):
-        assert field in _TONE_FIELDS
+        assert field in TONE_FIELDS
 
 
 def test_separation_damping_locked_without_a_separation_push(qapp):
@@ -38,6 +50,20 @@ def test_separation_damping_locked_without_a_separation_push(qapp):
 
     conf = controller.state.config
     controller.state.config = replace(conf, exposure=replace(conf.exposure, dye_separation=1.3))
+    sidebar.sync_ui()
+    assert sidebar.separation_damping_slider.isEnabled()
+
+
+def test_separation_damping_armed_by_a_trim_alone(qapp):
+    """A per-channel trim also gives Dye Separation a real per-pixel push even with the
+    global value left at its neutral 1.0 — the enabled check must ask the same question
+    the pipeline does (per_channel_dye_separation), not just the global scalar."""
+    controller = MagicMock()
+    controller.state = AppState()
+    sidebar = ToneSidebar(controller)
+
+    conf = controller.state.config
+    controller.state.config = replace(conf, exposure=replace(conf.exposure, dye_separation_trim_red=0.3))
     sidebar.sync_ui()
     assert sidebar.separation_damping_slider.isEnabled()
 
@@ -184,3 +210,54 @@ def test_channel_selector_hidden_in_bw(qapp):
     # Dye Separation is a color control: gone on a single-emulsion B&W paper.
     assert sidebar.dye_separation_slider.isHidden()
     assert sidebar.dye_separation_trim_slider.isHidden()
+
+
+def test_auto_density_grade_hide_on_a_raw_slide_but_stay_on_a_positive(qapp):
+    """They meter the frame to pick a look, which the transfer path exists to avoid for
+    a deliberate camera exposure -- but a Positive frame carries no such bracket, so
+    they run there exactly as on a negative (transfer_auto_terms)."""
+    controller = MagicMock()
+    controller.state = AppState()
+    sidebar = ToneSidebar(controller)
+
+    cfg = controller.state.config
+    controller.state.config = replace(
+        cfg, process=replace(cfg.process, process_mode=ProcessMode.E6, e6_normalize=False, positive_source=False)
+    )
+    sidebar.sync_ui()
+    assert sidebar.auto_density_btn.isHidden()
+    assert sidebar.auto_grade_btn.isHidden()
+    # The rest of the paper-model controls stay hidden either way.
+    assert sidebar.paper_dmin_btn.isHidden()
+
+    controller.state.config = replace(controller.state.config, process=replace(controller.state.config.process, positive_source=True))
+    sidebar.sync_ui()
+    assert not sidebar.auto_density_btn.isHidden()
+    assert not sidebar.auto_grade_btn.isHidden()
+    assert sidebar.paper_dmin_btn.isHidden()
+
+
+def test_dye_separation_trim_swaps_per_channel_on_transfer_too(qapp):
+    """The transfer curve now wires the per-channel trims the same way the print path
+    does, so the global/trim swap on the channel tabs must match — not the old
+    print-only exemption that kept the trim hidden and the global slider always shown."""
+    controller = MagicMock()
+    controller.state = AppState()
+    cfg = controller.state.config
+    controller.state.config = replace(
+        cfg,
+        process=replace(cfg.process, process_mode=ProcessMode.E6, e6_normalize=False),
+        exposure=replace(cfg.exposure, dye_separation=1.3, dye_separation_trim_red=0.25),
+    )
+    sidebar = ToneSidebar(controller)
+    sidebar.sync_ui()
+
+    assert not sidebar.dye_separation_slider.isHidden()
+    assert sidebar.dye_separation_trim_slider.isHidden()
+    assert not sidebar.separation_damping_slider.isHidden()
+
+    sidebar.ch_r_btn.setChecked(True)
+    assert sidebar.dye_separation_slider.isHidden()
+    assert not sidebar.dye_separation_trim_slider.isHidden()
+    assert abs(sidebar.dye_separation_trim_slider.value() - 0.25) < 1e-9
+    assert sidebar.separation_damping_slider.isHidden()

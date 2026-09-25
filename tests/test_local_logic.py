@@ -6,7 +6,7 @@ import numpy as np
 from negpy.domain.models import WorkspaceConfig
 from negpy.features.geometry.logic import smooth_polyline
 from negpy.features.local.logic import compute_local_maps
-from negpy.features.local.models import LocalAdjustmentsConfig, LocalMask, MaskShape
+from negpy.features.local.models import LocalAdjustmentsConfig, LocalMask, MaskKey, MaskShape
 
 
 def _center_square_mask(stops: float, feather: float = 0.0) -> LocalMask:
@@ -157,6 +157,14 @@ class TestMaskShapes(unittest.TestCase):
         ev = _ev(LocalAdjustmentsConfig(masks=(grad,)))
         np.testing.assert_array_equal(ev, np.zeros((100, 100), dtype=np.float32))
 
+    def test_a_disabled_mask_contributes_nothing(self) -> None:
+        cfg = LocalAdjustmentsConfig(masks=(replace(_center_square_mask(1.0), enabled=False),))
+        np.testing.assert_array_equal(_ev(cfg), np.zeros((100, 100), dtype=np.float32))
+
+    def test_a_disabled_mask_does_not_affect_its_neighbours(self) -> None:
+        cfg = LocalAdjustmentsConfig(masks=(_center_square_mask(0.5), replace(_center_square_mask(0.75), enabled=False)))
+        self.assertAlmostEqual(float(_ev(cfg)[50, 50]), 0.5, places=5)
+
     def test_invert_swaps_inside_for_outside(self) -> None:
         plain = _ev(LocalAdjustmentsConfig(masks=(_center_square_mask(1.0, feather=0.05),)))
         inverted = _ev(LocalAdjustmentsConfig(masks=(replace(_center_square_mask(1.0, feather=0.05), invert=True),)))
@@ -198,7 +206,54 @@ class TestSmoothPolyline(unittest.TestCase):
         self.assertAlmostEqual(float(ev[5, 5]), 0.0, places=5)
 
 
+class TestLimitedPlanes(unittest.TestCase):
+    """A tone-limited mask cannot be pre-summed: its weight depends on each pixel's tone,
+    so it carries its own shape plane after the two shared ones."""
+
+    def _square(self, x0: float, stops: float = 1.0, key: MaskKey = MaskKey.HIGHLIGHTS, **kw) -> LocalMask:
+        return LocalMask(vertices=((x0, 0.2), (x0 + 0.1, 0.2), (x0 + 0.1, 0.8), (x0, 0.8)), stops=stops, feather=0.0, key=key, **kw)
+
+    def test_no_limited_mask_keeps_the_two_shared_planes(self) -> None:
+        cfg = LocalAdjustmentsConfig(masks=(_center_square_mask(1.0),))
+        self.assertEqual(compute_local_maps(cfg, 100, 100, (100, 100)).shape, (100, 100, 2))
+
+    def test_a_limited_mask_writes_its_shape_to_its_own_plane_only(self) -> None:
+        cfg = LocalAdjustmentsConfig(masks=(self._square(0.1, stops=1.5, grade=-10.0), self._square(0.6, key=MaskKey.OFF)))
+        maps = compute_local_maps(cfg, 100, 100, (100, 100))
+        self.assertEqual(maps.shape, (100, 100, 3))
+        self.assertAlmostEqual(float(maps[50, 15, 2]), 1.0, places=5)
+        self.assertEqual(float(maps[50, 15, 0]), 0.0)
+        self.assertEqual(float(maps[50, 15, 1]), 0.0)
+        self.assertAlmostEqual(float(maps[50, 65, 0]), 1.0, places=5)
+        self.assertEqual(float(maps[50, 65, 2]), 0.0)
+
+    def test_a_fifth_limited_mask_prints_unlimited(self) -> None:
+        cfg = LocalAdjustmentsConfig(masks=tuple(self._square(0.05 + 0.18 * i, stops=0.5) for i in range(5)))
+        maps = compute_local_maps(cfg, 100, 100, (100, 100))
+        self.assertEqual(maps.shape, (100, 100, 6))
+        self.assertAlmostEqual(float(maps[50, 81, 0]), 0.5, places=5)
+
+    def test_a_disabled_limited_mask_takes_no_plane(self) -> None:
+        cfg = LocalAdjustmentsConfig(masks=(self._square(0.1, enabled=False), self._square(0.6)))
+        maps = compute_local_maps(cfg, 100, 100, (100, 100))
+        self.assertEqual(maps.shape, (100, 100, 3))
+        self.assertAlmostEqual(float(maps[50, 65, 2]), 1.0, places=5)
+
+
 class TestLocalSerialization(unittest.TestCase):
+    def test_roundtrip_preserves_the_tone_limit(self) -> None:
+        mask = LocalMask(vertices=((0.1, 0.1), (0.9, 0.1), (0.5, 0.9)), key=MaskKey.SHADOWS, key_zone=4.33, key_softness=2.0)
+        out = WorkspaceConfig.from_flat_dict(WorkspaceConfig(local=LocalAdjustmentsConfig(masks=(mask,))).to_dict()).local.masks[0]
+        self.assertEqual(out.key, MaskKey.SHADOWS)
+        self.assertAlmostEqual(out.key_zone, 4.33)
+        self.assertAlmostEqual(out.key_softness, 2.0)
+
+    def test_a_mask_saved_before_tone_limits_loads_unlimited(self) -> None:
+        legacy = {"local_masks": {"masks": [{"vertices": [[0.1, 0.1], [0.9, 0.1], [0.5, 0.9]], "stops": 0.5}]}}
+        mask = WorkspaceConfig.from_flat_dict(legacy).local.masks[0]
+        self.assertEqual(mask.key, MaskKey.OFF)
+        self.assertEqual((mask.key_zone, mask.key_softness), (6.0, 1.0))
+
     def test_roundtrip_preserves_masks(self) -> None:
         """to_dict -> from_flat_dict preserves polygon mask fields."""
         mask = LocalMask(
@@ -246,6 +301,16 @@ class TestLocalSerialization(unittest.TestCase):
         mask = WorkspaceConfig.from_flat_dict(legacy).local.masks[0]
         self.assertEqual(mask.shape, MaskShape.POLYGON)
         self.assertFalse(mask.invert)
+
+    def test_a_mask_saved_before_enabled_loads_as_enabled(self) -> None:
+        legacy = {"local_masks": {"masks": [{"vertices": [[0.1, 0.1], [0.9, 0.1], [0.5, 0.9]], "stops": 0.5}]}}
+        self.assertTrue(WorkspaceConfig.from_flat_dict(legacy).local.masks[0].enabled)
+
+    def test_roundtrip_preserves_enabled(self) -> None:
+        cfg = WorkspaceConfig(
+            local=LocalAdjustmentsConfig(masks=(LocalMask(vertices=((0.1, 0.1), (0.9, 0.1), (0.5, 0.9)), enabled=False),))
+        )
+        self.assertFalse(WorkspaceConfig.from_flat_dict(cfg.to_dict()).local.masks[0].enabled)
 
     def test_a_legacy_burn_migrates_to_a_positive_burn(self) -> None:
         legacy = {"local_masks": {"masks": [{"vertices": [[0.1, 0.1], [0.9, 0.1], [0.5, 0.9]], "strength": -1.0}]}}

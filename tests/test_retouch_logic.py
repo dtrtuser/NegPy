@@ -1,3 +1,4 @@
+import dataclasses
 import json
 
 import cv2
@@ -13,10 +14,14 @@ from negpy.features.retouch.logic import (
     compute_dust_stats,
     detect_bar,
     detect_luma_score,
+    drop_exclusions,
+    exclusion_cover,
+    exclusion_token,
     film_scale,
     hair_bake_token,
     ir_defect_score,
     lines_to_score,
+    luma_bake_token,
     manual_bake_token,
     normalize_ir,
     repair_components,
@@ -218,6 +223,15 @@ def _dusty_source(h=160, w=160, seed=42):
     return img
 
 
+def _two_speck_source(h=200, w=200, seed=7):
+    rng = np.random.default_rng(seed)
+    img = (np.full((h, w, 3), 0.18) * (1.0 + rng.normal(0, 0.02, (h, w, 3)))).astype(np.float32)
+    spots = [(40, 40), (160, 160)]
+    for y, x in spots:
+        img[y : y + 3, x : x + 3] = 0.005
+    return img, spots
+
+
 def test_detect_luma_score_finds_dark_speck():
     img = _dusty_source()
     score, hairs = detect_luma_score(img, dust_threshold=0.66, dust_size=4)
@@ -238,6 +252,112 @@ def test_detect_luma_score_clean_frame_is_empty():
     rng = np.random.default_rng(9)
     img = (np.full((160, 160, 3), 0.18) * (1.0 + rng.normal(0, 0.02, (160, 160, 3)))).astype(np.float32)
     assert detect_luma_score(img, 0.66, 4)[0] is None
+
+
+def test_exclusion_releases_the_detection_under_it():
+    img = _dusty_source()
+    score, _ = detect_luma_score(img, 0.66, 4)
+    assert score is not None
+    # Wide enough to cover the speck and the skirt the score ramps over.
+    size = _size_at_ref(30, img.shape)
+    out, hairs = drop_exclusions(score, None, [([[81.5 / 160.0, 81.5 / 160.0]], size)])
+    assert out is None and hairs is None, "nothing left to repair, so nothing is baked"
+
+
+def test_exclusion_elsewhere_leaves_the_detection_alone():
+    img = _dusty_source()
+    score, _ = detect_luma_score(img, 0.66, 4)
+    out, _ = drop_exclusions(score, None, [([[0.1, 0.1]], _size_at_ref(30, img.shape))])
+    assert out is not None
+    np.testing.assert_array_equal(out, score)
+
+
+def test_exclusion_releases_only_the_film_it_covers():
+    """The band is the cut, so a mark the brush clips keeps its repair on the side the
+    brush missed. Releasing the whole mark from a clipped edge is what this replaced."""
+    img = _dusty_source()
+    score, _ = detect_luma_score(img, 0.66, 4)
+    assert score is not None
+    marked = score < 1.0
+    ys, xs = np.where(marked)
+    near, far = (int(ys[0]), int(xs[0])), (int(ys[-1]), int(xs[-1]))
+    # A brush covering the near end of the mark and nowhere near the far one.
+    clip = ([[near[1] / 160.0, near[0] / 160.0]], _size_at_ref(6, img.shape))
+    out, _ = drop_exclusions(score, None, [clip])
+    assert out is not None, "the far side of the mark is still a defect"
+    assert out[near] > score[near], "the covered end is released"
+    assert out[far] == score[far], "the end it never reached is untouched"
+
+
+def test_exclusion_rim_does_not_step():
+    """The score is a ramp, so a hard cut at the brush edge would print the edge. The rim
+    is feathered, as a manual heal feathers its own."""
+    img = _dusty_source()
+    score, _ = detect_luma_score(img, 0.66, 4)
+    assert score is not None
+    out, _ = drop_exclusions(score, None, [([[0.5, 0.5]], _size_at_ref(8, img.shape))])
+    assert out is not None
+    row = out[80, :]
+    assert float(np.abs(np.diff(row)).max()) < 0.5, "no cliff across the released band"
+
+
+def test_exclusion_releases_only_the_covered_span_of_a_hair():
+    """A hair is long and thin, so whole-component release and covered-span release differ
+    most here. The mask is binary, so the footprint applies unfeathered."""
+    hair = np.zeros((200, 200), dtype=np.uint8)
+    hair[100, 20:180] = 1
+    out_score, out_hair = drop_exclusions(None, hair, [([[0.15, 0.5]], _size_at_ref(6, (200, 200)))])
+    assert out_score is None
+    assert out_hair is not None, "the rest of the hair is still repaired"
+    assert not out_hair[100, 30], "the covered span is released"
+    assert out_hair[100, 170], "the far end of the hair is not"
+
+
+def test_exclusion_clearing_the_last_hair_skips_the_bake():
+    hair = np.zeros((200, 200), dtype=np.uint8)
+    hair[100, 98:102] = 1
+    _score, out_hair = drop_exclusions(None, hair, [([[0.5, 0.5]], _size_at_ref(40, (200, 200)))])
+    assert out_hair is None, "nothing left to inpaint, so nothing is baked"
+
+
+def test_exclusion_leaves_untouched_specks_repaired():
+    """A band must not spill onto a defect it never reached."""
+    img, _ = _two_speck_source()
+    score, _ = detect_luma_score(img, 0.66, 4)
+    assert score is not None
+    near = ([[41.5 / 200.0, 41.5 / 200.0]], _size_at_ref(24, img.shape))
+    out, _ = drop_exclusions(score, None, [near])
+    assert out is not None
+    assert not (out < 1.0)[40:43, 40:43].any(), "the covered speck is released"
+    np.testing.assert_array_equal(out[150:175, 150:175], score[150:175, 150:175])
+
+
+def test_exclusion_stroke_covers_the_film_between_its_points():
+    """A drag is sampled sparsely, so the band has to be swept along the path — loose dabs
+    at the sample points would leave the film between them repaired."""
+    stroke = ([[0.2, 0.5], [0.8, 0.5]], _size_at_ref(6, (200, 200)))
+    cover = exclusion_cover([stroke], (200, 200))
+    assert cover[100, 40] and cover[100, 160], "the ends are covered"
+    assert cover[100, 60:140].all(), "and so is every pixel between them"
+
+
+def test_dust_busy_label_does_not_contradict_an_exclusion():
+    """The bake's busy toast reads back to the user, so it must not say it is repairing
+    dust on the pass a right-click asked it to stop repairing."""
+    from negpy.services.rendering.image_processor import _dust_step_label
+
+    base = RetouchConfig(dust_remove=True)
+    assert _dust_step_label(base) == "repairing dust"
+    assert "repairing" not in _dust_step_label(dataclasses.replace(base, dust_exclusion_strokes=[([[0.5, 0.5]], 6.0)]))
+
+
+def test_exclusion_token_tracks_the_strokes():
+    base = RetouchConfig(dust_remove=True)
+    assert exclusion_token(base) == ""
+    excluded = dataclasses.replace(base, dust_exclusion_strokes=[([[0.5, 0.5]], 6.0)])
+    assert exclusion_token(excluded) != ""
+    assert luma_bake_token(excluded) != luma_bake_token(base)
+    assert hair_bake_token(excluded) != hair_bake_token(base)
 
 
 def test_ir_long_scratch_is_healed_by_the_fill():
@@ -304,7 +424,10 @@ def test_detect_luma_score_joins_a_hair_into_one_component():
 
 
 def test_detect_bar_is_monotonic():
-    assert detect_bar(0.0) < detect_bar(0.5) < detect_bar(1.0)
+    bars = [detect_bar(s) for s in np.linspace(0.0, 1.0, 21)]
+    assert all(a < b for a, b in zip(bars, bars[1:]))
+    assert detect_bar(0.0) == 3.0 and detect_bar(0.66) == 9.0 and detect_bar(1.0) == 48.0
+    assert abs(detect_bar(0.66 - 1e-6) - detect_bar(0.66 + 1e-6)) < 1e-3
 
 
 def test_lower_threshold_marks_more_and_the_deepest_speck_always():
@@ -312,10 +435,19 @@ def test_lower_threshold_marks_more_and_the_deepest_speck_always():
     img[80:83, 80:83] = 0.18
     for y, level in ((40, 0.005), (100, 0.06), (160, 0.11)):
         img[y : y + 3, 100:103] = level
-    counts = [int(_marked(img, thr).sum()) for thr in (0.3, 0.66, 0.9)]
-    assert counts[0] >= counts[1] >= counts[2] > 0
-    for thr in (0.3, 0.66, 0.9):
+    sweep = (0.3, 0.66, 0.9, 1.0)
+    counts = [int(_marked(img, thr).sum()) for thr in sweep]
+    assert counts[0] >= counts[1] >= counts[2] >= counts[3] > 0
+    for thr in sweep:
         assert _marked(img, thr)[40:43, 100:103].any(), f"deepest speck lost at {thr}"
+
+
+def test_detect_bar_top_rejects_a_strong_mark():
+    rng = np.random.default_rng(42)
+    img = (np.full((200, 200, 3), 0.18) * (1.0 + rng.normal(0, 0.06, (200, 200, 3)))).astype(np.float32)
+    img[100:103, 100:103] = 0.10
+    assert _marked(img, 0.66)[100:103, 100:103].any()
+    assert not _marked(img, 1.0).any()
 
 
 def test_detect_luma_score_grainy_clean_frame_is_empty():

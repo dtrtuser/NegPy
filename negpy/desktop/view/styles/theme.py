@@ -126,10 +126,14 @@ class ThemeConfig:
     sidebar_expanded_defaults: Dict[str, bool] = field(
         default_factory=lambda: {
             "analysis": True,
+            "baseline": True,
             "process": True,
             "color": True,
             "tone": True,
             "geometry": True,
+            "autocrop": True,
+            "optics": False,
+            "assembly": False,
             "lab": True,
             "retouch": True,
         }
@@ -137,3 +141,9 @@ class ThemeConfig:
 
 
 THEME = ThemeConfig()
+# Scene marks cycle through existing tokens; red is left out because it means selected/armed.
+SCENE_COLORS = (THEME.channel_blue, THEME.status_success, THEME.warn_amber, THEME.filter_magenta, THEME.filter_cyan, THEME.mode_c41)
+
+
+def scene_color(ordinal: int) -> str:
+    return SCENE_COLORS[(ordinal - 1) % len(SCENE_COLORS)]

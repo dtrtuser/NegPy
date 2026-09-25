@@ -17,6 +17,7 @@ from negpy.desktop.view.canvas.crop_guides import CropGuide, guide_shapes
 from negpy.desktop.view.canvas.printing_notes import notes_outline, notes_sheet, paint_card, paint_map
 from negpy.desktop.view.styles.theme import THEME
 from negpy.desktop.view.widgets.stats import PIN_COLORS
+from negpy.domain.types import LUMA_B, LUMA_G, LUMA_R
 from negpy.features.exposure.analysis import (
     RING_GRID,
     STRIP_DENSITIES,
@@ -34,8 +35,16 @@ from negpy.features.exposure.analysis import (
     zone_region_labels,
 )
 from negpy.features.exposure.densitometer import zone_roman
-from negpy.features.geometry.logic import rotation_drag_angle, smooth_polyline, straighten_delta_degrees, translate_normalized_rect
-from negpy.features.local.logic import min_points, outline_points, overlapping_masks, rasterise
+from negpy.features.geometry.logic import (
+    compute_geometry_crop_rect,
+    rotation_drag_angle,
+    smooth_polyline,
+    straighten_delta_degrees,
+    translate_normalized_rect,
+)
+from negpy.features.exposure.logic import tone_key_weight_np
+from negpy.features.exposure.placement import key_edges
+from negpy.features.local.logic import limited_indices, min_points, outline_points, overlapping_masks, rasterise
 from negpy.features.local.models import MaskShape
 from negpy.features.retouch.models import HEAL_SIZE_REF
 from negpy.features.retouch.logic import trace_scratch
@@ -158,15 +167,18 @@ def feathered_mask_image(
     color: QColor,
     max_alpha: int,
     invert: bool = False,
+    weight: Optional[np.ndarray] = None,
 ) -> QImage:
     """A tinted premultiplied-alpha QImage of a feathered mask.
 
     `local_pts` are the control points, in raster pixels, and `sigma_px` is also in
     raster pixels. The engine rasteriser makes the alpha, so the tint agrees with
-    the render.
+    the render. `weight` (h, w) is a tone limit's key weight (tone_weight).
     """
     norm = [(x / w, y / h) for x, y in local_pts]
     alpha = rasterise(shape, norm, h, w, sigma_px, invert)
+    if weight is not None:
+        alpha = alpha * weight
     a = alpha * (max_alpha / 255.0)
     buf = np.empty((h, w, 4), dtype=np.uint8)
     buf[..., 0] = (color.red() * a).astype(np.uint8)
@@ -175,6 +187,29 @@ def feathered_mask_image(
     buf[..., 3] = (a * 255.0).astype(np.uint8)
     img = QImage(buf.data, w, h, w * 4, QImage.Format.Format_RGBA8888_Premultiplied)
     return img.copy()  # QImage-from-buffer does not own the memory
+
+
+def tone_weight(
+    lum: np.ndarray,
+    edges: Tuple[float, float],
+    u: np.ndarray,
+    v: np.ndarray,
+    roi: Optional[Tuple[int, int, int, int]],
+    crop_full: bool,
+) -> np.ndarray:
+    """A tone limit's key weight over a tint raster, 0 off the frame. `u` are the columns'
+    and `v` the rows' content-normalized coords, read into the normalized-log luma `lum`
+    as densitometer.map_display_to_norm reads one pixel; roi is (y1, y2, x1, x2)."""
+    nh, nw = lum.shape
+    if crop_full or roi is None:
+        px, py = u * nw, v * nh
+    else:
+        y1, y2, x1, x2 = roi
+        px, py = x1 + u * (x2 - x1), y1 + v * (y2 - y1)
+    ix = np.clip(px.astype(np.int64), 0, nw - 1)
+    iy = np.clip(py.astype(np.int64), 0, nh - 1)
+    inside = ((v >= 0.0) & (v < 1.0))[:, None] & ((u >= 0.0) & (u < 1.0))[None, :]
+    return np.where(inside, tone_key_weight_np(lum[iy[:, None], ix[None, :]], *edges), 0.0).astype(np.float32)
 
 
 _LINE_HOVER_DEBOUNCE_MS = 90
@@ -195,6 +230,7 @@ class CanvasOverlay(QWidget):
     cursor_left = pyqtSignal()
     local_mask_created = pyqtSignal(str, list)  # (shape value, viewport-normalised points)
     scratch_completed = pyqtSignal(list)
+    dust_exclusion_painted = pyqtSignal(list)  # viewport-normalized points of a right-drag
     local_mask_selected = pyqtSignal(int)
     local_mask_edited = pyqtSignal(int, list)  # (mask index, viewport-normalized vertices)
     local_vertex_deleted = pyqtSignal(int, int)  # (mask index, vertex index)
@@ -252,11 +288,16 @@ class CanvasOverlay(QWidget):
         # Scratch heal (open polyline) interaction state
         self._scratch_pts: List[QPointF] = []
         self._heal_drag_pts: List[QPointF] = []
+        # Right-drag path painting an optical-removal exclusion. Non-empty from the press to
+        # the release, which is also what holds the context menu back (contextMenuEvent).
+        self._exclude_drag_pts: List[QPointF] = []
         # Per mask, in list order: the outline (hit test, notes) and the control points
         # (drag handles). Only a polygon has the same points in both lists.
         self._local_mask_screen_polys: List[List[QPointF]] = []
         self._local_mask_screen_ctrl: List[List[QPointF]] = []
         self._mask_img_cache: Dict[tuple, QImage] = {}
+        # (render_serial, luma) of the normalized log, which a tone-limited tint keys on.
+        self._tone_luma_cache: Optional[Tuple[Any, np.ndarray]] = None
 
         # Geometry-aligned IR layer raster, cached by (uv_grid, preview_ir) identity so it
         # rebuilds only when the render or source changes.
@@ -312,6 +353,7 @@ class CanvasOverlay(QWidget):
 
         self._buffer_overlay_ratio: float = 0.0
         self._buffer_overlay_visible: bool = False
+        self._buffer_slider_dragging: bool = False
         self._buffer_hide_timer = QTimer(self)
         self._buffer_hide_timer.setSingleShot(True)
         self._buffer_hide_timer.timeout.connect(self._hide_buffer_overlay)
@@ -320,6 +362,12 @@ class CanvasOverlay(QWidget):
         self._rotation_grid_timer = QTimer(self)
         self._rotation_grid_timer.setSingleShot(True)
         self._rotation_grid_timer.timeout.connect(self._hide_rotation_grid)
+
+        self._crop_preview_rect: Optional[Tuple[float, float, float, float]] = None
+        self._crop_preview_visible: bool = False
+        self._crop_preview_timer = QTimer(self)
+        self._crop_preview_timer.setSingleShot(True)
+        self._crop_preview_timer.timeout.connect(self._hide_crop_preview)
 
         # Guide for the line tool. A trace is a slope search over the whole frame, too heavy
         # per mouse-move, so it runs on a debounce and the last result is painted.
@@ -363,8 +411,18 @@ class CanvasOverlay(QWidget):
     def show_analysis_buffer(self, ratio: float) -> None:
         self._buffer_overlay_ratio = max(0.0, min(ratio, 0.3))
         self._buffer_overlay_visible = True
-        self._buffer_hide_timer.start(1000)
+        if not self._buffer_slider_dragging:
+            self._buffer_hide_timer.start(1000)
         self.update()
+
+    def set_analysis_buffer_dragging(self, dragging: bool) -> None:
+        """Hold the overlay while the slider is pressed; a stationary press fires no
+        valueChanged to keep restarting the hide timer."""
+        self._buffer_slider_dragging = dragging
+        if dragging:
+            self._buffer_hide_timer.stop()
+        elif self._buffer_overlay_visible:
+            self._buffer_hide_timer.start(1000)
 
     def _hide_buffer_overlay(self) -> None:
         self._buffer_overlay_visible = False
@@ -378,6 +436,30 @@ class CanvasOverlay(QWidget):
 
     def _hide_rotation_grid(self) -> None:
         self._rotation_grid_visible = False
+        self.update()
+
+    def show_crop_preview(self) -> None:
+        """Previews the wedge Crop by Default would trim, while Fine Rot/Tilt/Swing are
+        adjusted; lingers 1s. Measured against the raw pre-transform frame, since the
+        rendered preview is already cropped to the safe rect and would show nothing left
+        to trim."""
+        geo = self.state.config.geometry
+        raw = self.state.preview_raw
+        if not (geo.crop_to_valid and not geo.crop_from_auto) or raw is None:
+            return
+        h, w = raw.shape[:2]
+        if geo.rotation % 2 == 1:
+            w, h = h, w
+        rect = compute_geometry_crop_rect(geo.fine_rotation, geo.converge_v, geo.converge_h, w, h)
+        if rect == (0.0, 0.0, 1.0, 1.0):
+            return
+        self._crop_preview_rect = rect
+        self._crop_preview_visible = True
+        self._crop_preview_timer.start(1000)
+        self.update()
+
+    def _hide_crop_preview(self) -> None:
+        self._crop_preview_visible = False
         self.update()
 
     def set_tool_mode(self, mode: ToolMode) -> None:
@@ -677,6 +759,9 @@ class CanvasOverlay(QWidget):
             painter.setPen(pen)
             painter.drawRect(inner)
 
+        if self._draws_exclusion_brush() and visible_rect.contains(self._mouse_pos):
+            self._draw_brush(painter, THEME.warn_amber)
+
         if self._tool_mode != ToolMode.NONE and visible_rect.contains(self._mouse_pos):
             if self._tool_mode in (ToolMode.DUST_PICK, ToolMode.SCRATCH_PICK):
                 self._draw_brush(painter)
@@ -701,6 +786,13 @@ class CanvasOverlay(QWidget):
             self._draw_scratch_in_progress(painter)
         if self._tool_mode == ToolMode.DUST_PICK:
             self._draw_heal_drag_in_progress(painter)
+        # Committed patches show with the detection overlay or a retouch tool, where the
+        # question "what is the detector doing here" is being asked; a drag always shows.
+        if self._exclude_drag_pts or (
+            self.state.config.retouch.dust_exclusion_strokes
+            and (self.state.dust_overlay_mode != "off" or self._tool_mode in (ToolMode.DUST_PICK, ToolMode.SCRATCH_PICK))
+        ):
+            self._draw_dust_exclusions(painter)
         if self._tool_mode == ToolMode.STRAIGHTEN:
             self._draw_straighten_line(painter)
 
@@ -732,13 +824,16 @@ class CanvasOverlay(QWidget):
         if self._rotation_grid_visible:
             self._draw_rotation_grid(painter, visible_rect)
 
+        if self._crop_preview_visible and self._crop_preview_rect:
+            self._draw_crop_preview(painter, visible_rect)
+
         # Keyed off the stashed baseline, not state.compare_mode: the toggle flips before its
         # render lands, and half a split with no before frame is just the edit.
         if self._compare_split_active() and content_aligned:
             self._draw_compare_split(painter)
 
         # Exclusive with the split above, so the two badges cannot land on each other.
-        if self.state.negative_peek or self.state.flat_peek:
+        if self.state.negative_peek or self.state.embedded_peek or self.state.flat_peek:
             self._draw_peek_badge(painter)
 
         # Last: the glass sits over everything else and claims no content rect, so it stays out
@@ -763,6 +858,33 @@ class CanvasOverlay(QWidget):
     def _draw_rotation_grid(self, painter: QPainter, visible_rect: QRectF) -> None:
         """Dense leveling grid shown while Fine Rot is adjusted (Lightroom-style)."""
         self._draw_grid(painter, visible_rect, _ROTATION_GRID_DIVISIONS, _GRID_ALPHA)
+
+    def _draw_crop_preview(self, painter: QPainter, visible_rect: QRectF) -> None:
+        """Reconstructs the raw frame's extent around the already-cropped preview and
+        darkens the margin Crop by Default trimmed, an outward twin of the analysis-
+        buffer margin draw (that one darkens inward, from an uncropped frame)."""
+        if self._crop_preview_rect is None:
+            return
+        x1, y1, x2, y2 = self._crop_preview_rect
+        kw, kh = x2 - x1, y2 - y1
+        if kw <= 1e-6 or kh <= 1e-6:
+            return
+        d = visible_rect
+        full_w, full_h = d.width() / kw, d.height() / kh
+        full = QRectF(d.left() - full_w * x1, d.top() - full_h * y1, full_w, full_h)
+
+        painter.setBrush(QColor(0, 0, 0, 140))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRect(QRectF(full.left(), full.top(), full.width(), d.top() - full.top()))
+        painter.drawRect(QRectF(full.left(), d.bottom(), full.width(), full.bottom() - d.bottom()))
+        painter.drawRect(QRectF(full.left(), d.top(), d.left() - full.left(), d.height()))
+        painter.drawRect(QRectF(d.right(), d.top(), full.right() - d.right(), d.height()))
+
+        pen = QPen(QColor(THEME.accent_primary), 1, Qt.PenStyle.DashLine)
+        pen.setCosmetic(True)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(pen)
+        painter.drawRect(d)
 
     def _draw_crop_guides(self, painter: QPainter, rect: QRectF) -> None:
         """Selected composition guide (thirds, phi, spiral, ...) inside the crop rect."""
@@ -844,16 +966,15 @@ class CanvasOverlay(QWidget):
         painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, text)
 
     def _draw_peek_badge(self, painter: QPainter) -> None:
-        """Name the peek on the canvas. A peek replaces the print with something that is not
-        one, and the only other thing that says so is a toolbar button off at the edge."""
-        text = "NEGATIVE" if self.state.negative_peek else "FLAT SCAN"
+        """Name the peek on the canvas. Otherwise only the toolbar says the view is on."""
+        text = "NEGATIVE" if self.state.negative_peek else ("EMBEDDED" if self.state.embedded_peek else "FLAT SCAN")
         rect = self._content_view_rect()
         if rect.isEmpty():
             return
         width = painter.fontMetrics().horizontalAdvance(text) + 24.0
         self._draw_view_badge(painter, text, rect.left() + 12, rect.top() + 12, width)
 
-    def _draw_brush(self, painter: QPainter) -> None:
+    def _draw_brush(self, painter: QPainter, fill: Optional[str] = None) -> None:
         radius = self._brush_screen_radius(self.state.config.retouch.manual_dust_size)
 
         painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -862,7 +983,7 @@ class CanvasOverlay(QWidget):
         painter.setPen(pen)
         painter.drawEllipse(self._mouse_pos, radius, radius)
 
-        accent = QColor(THEME.accent_primary)
+        accent = QColor(fill or THEME.accent_primary)
         accent.setAlpha(60)
         painter.setBrush(accent)
         painter.setPen(Qt.PenStyle.NoPen)
@@ -933,6 +1054,37 @@ class CanvasOverlay(QWidget):
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(fill)
         painter.drawPath(self._heal_region_path(self._heal_drag_pts, radius))
+
+    def _draw_dust_exclusions(self, painter: QPainter) -> None:
+        """Bands held back from optical removal: the committed strokes, plus the one under a
+        right-drag in progress. Each stroke fills as one region, so its own dabs do not
+        composite into a chain of darker blobs."""
+        conf = self.state.config.retouch
+        fill = QColor(THEME.warn_amber)
+        fill.setAlpha(60)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(fill)
+
+        if conf.dust_exclusion_strokes:
+            with self.state.metrics_lock:
+                uv_grid = self.state.last_metrics.get("uv_grid")
+            if uv_grid is not None:
+                for points, size in conf.dust_exclusion_strokes:
+                    screen_pts = [self._raw_to_screen(px, py, uv_grid) for px, py in points]
+                    self._fill_brush_band(painter, screen_pts, max(1.5, self._brush_screen_radius(size)))
+
+        if self._exclude_drag_pts:
+            self._fill_brush_band(painter, self._exclude_drag_pts, max(1.5, self._brush_screen_radius(conf.manual_dust_size)))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+    def _fill_brush_band(self, painter: QPainter, pts: List[QPointF], radius: float) -> None:
+        """The swept band of a brush path, smoothed past two points like the mask is."""
+        if len(pts) == 1:
+            painter.drawEllipse(pts[0], radius, radius)
+            return
+        if len(pts) >= 3:
+            pts = [QPointF(x, y) for x, y in smooth_polyline([(p.x(), p.y()) for p in pts], closed=False)]
+        painter.drawPath(self._heal_region_path(pts, radius))
 
     def _draw_straighten_line(self, painter: QPainter) -> None:
         """Reference line being dragged with the straighten tool, plus a badge
@@ -1748,10 +1900,12 @@ class CanvasOverlay(QWidget):
 
         with self.state.metrics_lock:
             uv_grid = self.state.last_metrics.get("uv_grid")
+            metrics = dict(self.state.last_metrics)
         if uv_grid is None:
             return
 
         selected = getattr(self.state, "local_selected_mask", -1)
+        limited = limited_indices(self.state.config.local)
         fresh_cache: Dict[tuple, QImage] = {}
         for i, mask in enumerate(masks):
             is_selected = i == selected
@@ -1766,7 +1920,7 @@ class CanvasOverlay(QWidget):
             self._local_mask_screen_polys.append([QPointF(x, y) for x, y in curve])
             self._local_mask_screen_ctrl.append(ctrl)
 
-            if i in getattr(self.state, "local_hidden_masks", ()):
+            if not mask.enabled or i in getattr(self.state, "local_hidden_masks", ()):
                 continue
             outline = QColor(THEME.burn) if mask.stops > 0 else QColor(THEME.dodge)
             max_alpha = 70 if is_selected else 32
@@ -1792,10 +1946,12 @@ class CanvasOverlay(QWidget):
                 # Bbox-relative points are pan-invariant, so panning reuses the cache.
                 local = tuple((round((p.x() - x0) * scale, 1), round((p.y() - y0) * scale, 1)) for p in draw_ctrl)
 
-                key = (mask.shape, mask.invert, local, rw, rh, round(sigma_screen * scale, 2), outline.rgb(), max_alpha)
+                tone = self._tone_tint(mask, metrics, x0, y0, bw, bh) if i in limited else None
+                key = (mask.shape, mask.invert, local, rw, rh, round(sigma_screen * scale, 2), outline.rgb(), max_alpha, tone and tone[0])
                 img = self._mask_img_cache.get(key)
                 if img is None:
-                    img = feathered_mask_image(mask.shape, local, rw, rh, sigma_screen * scale, outline, max_alpha, mask.invert)
+                    weight = tone[1](rw, rh) if tone else None
+                    img = feathered_mask_image(mask.shape, local, rw, rh, sigma_screen * scale, outline, max_alpha, mask.invert, weight)
                 fresh_cache[key] = img
                 painter.drawImage(QRectF(x0, y0, bw, bh), img)
 
@@ -1816,6 +1972,52 @@ class CanvasOverlay(QWidget):
             if is_selected and self._tool_mode in _LOCAL_TOOLS and not self._lasso_drawing:
                 self._draw_local_handles(painter, mask.shape, draw_ctrl, outline)
         self._mask_img_cache = fresh_cache
+
+    def _tone_tint(self, mask: Any, metrics: Dict[str, Any], x0: float, y0: float, bw: float, bh: float) -> Optional[Tuple[tuple, Any]]:
+        """(cache key, weight builder) for a tone-limited mask's tint over the screen box
+        (x0, y0, bw, bh); None before a render has published the normalized log."""
+        lum = self._tone_luma(metrics)
+        if lum is None:
+            return None
+        content = self._content_view_rect()
+        if content.width() <= 0 or content.height() <= 0:
+            return None
+        conf = self.state.config
+        edges = key_edges(mask, conf.exposure, conf.process.process_mode, metrics)
+        roi = metrics.get("active_roi")
+        crop_full = self.state.active_tool in (ToolMode.CROP_MANUAL, ToolMode.ANALYSIS_DRAW)
+        # Box relative to the content, so panning reuses the cache.
+        bx, by = x0 - content.x(), y0 - content.y()
+        key = (
+            metrics.get("render_serial"),
+            edges,
+            roi,
+            crop_full,
+            round(bx, 1),
+            round(by, 1),
+            round(content.width(), 1),
+            round(content.height(), 1),
+        )
+
+        def build(rw: int, rh: int) -> np.ndarray:
+            u = (bx + (np.arange(rw) + 0.5) * bw / rw) / content.width()
+            v = (by + (np.arange(rh) + 0.5) * bh / rh) / content.height()
+            return tone_weight(lum, edges, u, v, roi, crop_full)
+
+        return key, build
+
+    def _tone_luma(self, metrics: Dict[str, Any]) -> Optional[np.ndarray]:
+        """The normalized log's luma, read back once per render."""
+        nl = metrics.get("normalized_log")
+        if nl is None:
+            return None
+        serial = metrics.get("render_serial")
+        if self._tone_luma_cache is not None and serial is not None and self._tone_luma_cache[0] == serial:
+            return self._tone_luma_cache[1]
+        arr = nl if isinstance(nl, np.ndarray) else np.asarray(nl.readback_region(0, 0, nl.width, nl.height), dtype=np.float32)
+        lum = (LUMA_R * arr[..., 0] + LUMA_G * arr[..., 1] + LUMA_B * arr[..., 2]).astype(np.float32)
+        self._tone_luma_cache = (serial, lum)
+        return lum
 
     def _draw_gradient_axis(self, painter: QPainter, a: QPointF, b: QPointF) -> None:
         """Draw the card edge. A solid line shows full exposure, a dashed line shows
@@ -1847,17 +2049,14 @@ class CanvasOverlay(QWidget):
 
     def _draw_printing_notes(self, painter: QPainter) -> None:
         """The printer's marked-up work print: hatched burns, open dodges, ±stop badges,
-        and the print recipe. Every mask is on the map, hidden ones included — the eye
-        unclutters editing, but a record that omits a burn is wrong."""
+        and the print recipe. A hidden (eye-off) mask still burns, so it stays on the map;
+        a disabled one prints nothing, so it is left off."""
         rect = self._content_view_rect()
+        notes_by_number = {n.number: n for n in mask_notes(self.state.config.local, self.state.config.exposure.grade)}
         polys = [
-            (notes_outline(mask.shape, ctrl, rect), note)
-            for mask, ctrl, note in zip(
-                self.state.config.local.masks,
-                self._local_mask_screen_ctrl,
-                mask_notes(self.state.config.local, self.state.config.exposure.grade),
-            )
-            if len(ctrl) >= min_points(mask.shape)
+            (notes_outline(mask.shape, ctrl, rect), notes_by_number[i + 1])
+            for i, (mask, ctrl) in enumerate(zip(self.state.config.local.masks, self._local_mask_screen_ctrl))
+            if mask.enabled and len(ctrl) >= min_points(mask.shape)
         ]
         paint_map(painter, polys)
         paint_card(painter, QPointF(rect.x() + _NOTES_CARD_INSET_PX, rect.y() + _NOTES_CARD_TOP_PX), self._recipe_lines())
@@ -1958,6 +2157,10 @@ class CanvasOverlay(QWidget):
 
         return float(np.clip(nb_x, 0, 1)), float(np.clip(nb_y, 0, 1))
 
+    def image_coords_at(self, screen_pos: QPointF) -> Optional[Tuple[float, float]]:
+        """Viewport-normalized coordinates of a widget position, or None off the frame."""
+        return self._map_to_image_coords(screen_pos)
+
     def _map_to_image_coords_unbounded(self, screen_pos: QPointF) -> Optional[Tuple[float, float]]:
         """As `_map_to_image_coords`, but keeps points off the frame.
 
@@ -2002,6 +2205,18 @@ class CanvasOverlay(QWidget):
             self.parent()._is_panning = True
             self.parent()._last_mouse_pos = event.position()
             self.parent().setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+
+        # A right press over the frame arms an exclusion drag while Optical Removal is on.
+        # It stays a press until the release says which it was: a drag paints, a click gets
+        # the context menu the armed state held back.
+        if (
+            event.button() == Qt.MouseButton.RightButton
+            and self.state.config.retouch.dust_remove
+            and self._content_view_rect().contains(event.position())
+        ):
+            self._exclude_drag_pts = [event.position()]
             event.accept()
             return
 
@@ -2174,6 +2389,22 @@ class CanvasOverlay(QWidget):
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         self._mouse_pos = event.position()
+
+        # An exclusion drag owns the mouse like the divider does below: it is painting, and a
+        # tool or a pan reading the same motion would act on it twice. Sampled at half the
+        # brush radius, so the committed disks overlap into a band, and clamped to the frame.
+        if self._exclude_drag_pts and event.buttons() & Qt.MouseButton.RightButton:
+            rect = self._content_view_rect()
+            pos = QPointF(
+                float(np.clip(event.position().x(), rect.left(), rect.right())),
+                float(np.clip(event.position().y(), rect.top(), rect.bottom())),
+            )
+            spacing = max(6.0, self._brush_screen_radius(self.state.config.retouch.manual_dust_size) * 0.5)
+            if (pos - self._exclude_drag_pts[-1]).manhattanLength() >= spacing:
+                self._exclude_drag_pts.append(pos)
+            self.update()
+            event.accept()
+            return
 
         # First: a divider drag owns the mouse, and no tool or readout should see it.
         if self._split_dragging:
@@ -2636,7 +2867,39 @@ class CanvasOverlay(QWidget):
             self.scratch_completed.emit(vertices)
         self.update()
 
+    def _draws_exclusion_brush(self) -> bool:
+        """Armed to exclude on a right-click, the brush is what a click lays down and what a
+        pinch sizes, so it is drawn in the band's amber with no tool active to draw it."""
+        return self._tool_mode == ToolMode.NONE and self.state.config.retouch.dust_remove and self._right_click_excludes()
+
+    def _right_click_excludes(self) -> bool:
+        """Whether a plain right-click excludes instead of opening the menu. The heal and
+        scratch tools keep theirs: right-click is how a heal is deleted while one is live."""
+        return self.state.right_click_excludes and self._tool_mode not in (ToolMode.DUST_PICK, ToolMode.SCRATCH_PICK)
+
+    def contextMenuEvent(self, event) -> None:
+        # An armed right press may still become an exclusion drag, so the menu waits for the
+        # release to decide; a press that was never armed falls through to the canvas.
+        if self._exclude_drag_pts:
+            event.accept()
+            return
+        event.ignore()
+
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if self._exclude_drag_pts and event.button() == Qt.MouseButton.RightButton:
+            pts = self._exclude_drag_pts
+            self._exclude_drag_pts = []
+            vertices = [c for c in (self._map_to_image_coords(p) for p in pts) if c is not None]
+            if len(vertices) > 1 or (vertices and self._right_click_excludes()):
+                self.dust_exclusion_painted.emit(vertices)
+            else:
+                # The press never moved and a click is not set to exclude, so it was the
+                # right-click it looked like, and the menu contextMenuEvent held back is owed.
+                self.parent().show_canvas_menu(event.position(), event.globalPosition().toPoint())
+            self.update()
+            event.accept()
+            return
+
         if self._split_dragging:
             self._split_dragging = False
             self.unsetCursor()

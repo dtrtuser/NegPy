@@ -28,10 +28,11 @@ _DETECT_PAD_PX = 2.5
 _DETECT_AVG_PX = 3
 _DETECT_MAD_GAIN = 4.0
 _DETECT_SIGMA_MIN = 0.003
-# Slider → seed bar in σ; the default sits near the top of the range where clean film of any
-# grain yields at most a handful of marks per frame.
+# Slider → seed bar in σ: linear to the default, geometric above it.
 _DETECT_Z_LOOSE = 3.0
-_DETECT_Z_TIGHT = 12.0
+_DETECT_Z_DEFAULT = 9.0
+_DETECT_Z_TIGHT = 48.0
+_DETECT_DEFAULT_POS = 0.66
 # Hysteresis: a component seeded above the bar grows through connected pixels down to this
 # floor (absolute, or a fraction of the seed bar), within a reach of the seed. Grain is
 # isolated, so it never joins; a defect's soft skirt does.
@@ -113,6 +114,7 @@ _SCRATCH_WIDTH_MIN = 3.0
 # side and prints as a dark blotch on the light one.
 _IR_MAX_UPSAMPLE = 1.5
 _IR_DETECT_MAX = 3600  # memory: ir_ratio_and_gain holds ~10 planes of it
+_IR_DOWNSAMPLE_WORK_BYTES = 64 * 1024 * 1024
 # The film-footprint windows below are px at this detection long edge and scale with the
 # plane (_ir_win). On a finer plane a wide hair fills an unscaled base window, depresses
 # its own base and stops reading as a defect.
@@ -310,7 +312,10 @@ def compute_dust_stats(img: ImageBuffer, dust_size: int) -> Tuple[np.ndarray, ..
 def detect_bar(slider: float) -> float:
     """UI Threshold (higher = conservative) → the seed bar in local σ."""
     s = float(np.clip(slider, 0.0, 1.0))
-    return _DETECT_Z_LOOSE + (_DETECT_Z_TIGHT - _DETECT_Z_LOOSE) * s
+    if s <= _DETECT_DEFAULT_POS:
+        return _DETECT_Z_LOOSE + (_DETECT_Z_DEFAULT - _DETECT_Z_LOOSE) * s / _DETECT_DEFAULT_POS
+    t = (s - _DETECT_DEFAULT_POS) / (1.0 - _DETECT_DEFAULT_POS)
+    return _DETECT_Z_DEFAULT * (_DETECT_Z_TIGHT / _DETECT_Z_DEFAULT) ** t
 
 
 def detect_luma_score(
@@ -354,6 +359,65 @@ def detect_luma_score(
     compact, hair_mask = split_hairs(hit)
     score = _mask_to_score(compact, _DETECT_PAD_PX * scale) if compact.any() else None
     return score, hair_mask
+
+
+def exclusion_cover(strokes: List[Tuple], shape: Tuple[int, int]) -> np.ndarray:
+    """Excluded strokes → their binary footprint on a plane of ``shape``. A stroke is the
+    band its whole path sweeps, not its sampled points: the drag is sampled sparsely and
+    loose dabs would leave the film between them repaired. Smoothed past two points and
+    round-capped, so the band matches the one the overlay draws."""
+    h, w = shape[:2]
+    cover = np.zeros((h, w), dtype=np.uint8)
+    scale = max(w, h) / HEAL_SIZE_REF
+    for points, size in strokes:
+        radius = max(1, int(round(float(size) * scale * 0.5)))
+        chain = [(float(p[0]) * w, float(p[1]) * h) for p in points]
+        if len(chain) >= 3:
+            chain = smooth_polyline(chain, closed=False)
+        pts = np.round(np.array(chain, dtype=np.float32)).astype(np.int32)
+        if len(pts) > 1:
+            cv2.polylines(cover, [pts], False, 1, thickness=max(1, 2 * radius))
+        for cx, cy in pts:  # round caps and joins, as a thick polyline alone ends flat
+            cv2.circle(cover, (int(cx), int(cy)), radius, 1, -1)
+    return cover
+
+
+def drop_exclusions(
+    score: Optional[np.ndarray],
+    hair_mask: Optional[np.ndarray],
+    strokes: List[Tuple],
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """Release the optical detections the excluded strokes cover, so the film there arrives
+    at the render untouched. The band is the cut: a defect crossing its rim keeps the repair
+    on the side the brush missed, so half a mark can be released without the rest. A score
+    with nothing left below clean, or an emptied hair mask, comes back as None: the repair
+    is then skipped rather than run over an identity."""
+    if not strokes or (score is None and hair_mask is None):
+        return score, hair_mask
+    ref = score if score is not None else hair_mask
+    cover = exclusion_cover(strokes, ref.shape[:2])  # type: ignore[union-attr]
+    if score is not None:
+        # Feather the rim, as the manual heal does its own: the score is a ramp, and cutting
+        # one at the brush edge prints the edge as a step.
+        d = cv2.distanceTransform(cover, cv2.DIST_L2, 3)
+        alpha = np.clip(d / _MANUAL_RIM_PX, 0.0, 1.0)
+        score = (score + alpha * (1.0 - score)).astype(np.float32)
+        if not (score < 1.0).any():
+            score = None
+    if hair_mask is not None:
+        # Binary, so it takes the footprint unfeathered.
+        hair_mask = np.where(cover > 0, 0, hair_mask).astype(hair_mask.dtype)
+        if not hair_mask.any():
+            hair_mask = None
+    return score, hair_mask
+
+
+def exclusion_token(retouch) -> str:
+    """Config identity of the excluded strokes. Folded into the luma and hair tokens: a
+    released detection changes the baked source as surely as a new one does."""
+    if not retouch.dust_exclusion_strokes:
+        return ""
+    return "|ex" + hashlib.sha1(repr(retouch.dust_exclusion_strokes).encode()).hexdigest()[:12]
 
 
 def strokes_to_score(
@@ -676,6 +740,44 @@ def _fit_sample(mask: np.ndarray) -> np.ndarray:
     return idx[::step] if step > 1 else idx
 
 
+def _erode_resize_bounded(plane: np.ndarray, dims: Tuple[int, int], kernel: np.ndarray) -> np.ndarray:
+    """Apply the min-preserving downsample in source-row blocks."""
+    if plane.ndim == 3 and plane.shape[2] == 1:
+        plane = plane[:, :, 0]
+    h, w = plane.shape[:2]
+    dw, dh = dims
+    scale_y = h / dh
+    channels = plane.shape[2] if plane.ndim == 3 else 1
+    bytes_per_row = max(1, w * channels * plane.dtype.itemsize)
+    source_rows = max(1, (_IR_DOWNSAMPLE_WORK_BYTES // 4) // bytes_per_row)
+    output_rows = max(1, int(source_rows * dh / h))
+    radius = kernel.shape[0] // 2
+    output = np.empty((dh, dw, channels), dtype=np.float32) if plane.ndim == 3 else np.empty((dh, dw), dtype=np.float32)
+
+    for top in range(0, dh, output_rows):
+        bottom = min(dh, top + output_rows)
+        source_top = math.floor(top * scale_y)
+        source_bottom = min(h, math.ceil((bottom - 1) * scale_y + scale_y))
+        read_top = max(0, source_top - radius)
+        read_bottom = min(h, source_bottom + radius)
+        source = np.ascontiguousarray(plane[read_top:read_bottom], dtype=np.float32)
+        eroded = cv2.erode(source, kernel)
+        core = eroded[source_top - read_top : source_bottom - read_top]
+        horizontal = cv2.resize(core, (dw, len(core)), interpolation=cv2.INTER_AREA)
+        # Keep the full-image sampling grid across fractional block boundaries.
+        for row in range(top, bottom):
+            start = row * scale_y
+            end = start + scale_y
+            first, last = math.floor(start), min(h, math.ceil(end))
+            indices = np.arange(first, last)
+            overlap = np.minimum(indices + 1, end) - np.maximum(indices, start)
+            # OpenCV's area table omits fractional edges at or below this cutoff.
+            weights = (np.where(overlap > 1e-3, overlap, 0.0) / min(scale_y, h - start)).astype(np.float32)
+            values = horizontal[first - source_top : last - source_top]
+            output[row] = np.sum(values * weights.reshape((-1,) + (1,) * (values.ndim - 1)), axis=0)
+    return output
+
+
 def downsample_ir(plane: np.ndarray, target_long_edge: int, dims: Optional[Tuple[int, int]] = None) -> np.ndarray:
     """Min-preserving IR downsample to ``target_long_edge`` (no-op if already smaller).
     ``dims`` (w, h) overrides the computed target for callers that must land on an
@@ -688,20 +790,23 @@ def downsample_ir(plane: np.ndarray, target_long_edge: int, dims: Optional[Tuple
     film still sits at ~1.0. Every IR consumer routes through here or preview and export
     detect different region sets.
     """
-    plane = np.ascontiguousarray(plane, dtype=np.float32)
+    plane = np.asarray(plane, dtype=np.float32)
     h, w = plane.shape[:2]
     long_edge = max(h, w)
     if long_edge <= target_long_edge and dims is None:
-        return plane
+        return np.ascontiguousarray(plane)
     if dims is None:
         s = target_long_edge / long_edge
         dims = (max(1, int(round(w * s))), max(1, int(round(h * s))))
     if dims == (w, h):
-        return plane
+        return np.ascontiguousarray(plane)
     # Erode by the resample footprint: a 1.25x downsample must not fatten by a 4.5x kernel.
     k = max(1, int(round(long_edge / target_long_edge)) | 1)
     if k > 1:
-        plane = cv2.erode(plane, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        if plane.nbytes > _IR_DOWNSAMPLE_WORK_BYTES:
+            return _erode_resize_bounded(plane, dims, kernel)
+        plane = cv2.erode(np.ascontiguousarray(plane), kernel)
     return cv2.resize(plane, dims, interpolation=cv2.INTER_AREA).astype(np.float32)
 
 
@@ -1160,7 +1265,7 @@ def luma_bake_token(retouch) -> str:
     actually detected, and the speck fill runs regardless."""
     if not retouch.dust_remove:
         return ""
-    return f"|dust{round(float(retouch.dust_threshold), 3)}_{int(retouch.dust_size)}"
+    return f"|dust{round(float(retouch.dust_threshold), 3)}_{int(retouch.dust_size)}" + exclusion_token(retouch)
 
 
 def ir_bake_token(retouch, has_ir: bool) -> str:
@@ -1282,7 +1387,10 @@ def hair_bake_token(retouch) -> str:
     """Detection-param identity for the hair inpaint (folded into source_hash when a
     hair is actually detected). Distinct params → distinct inpainted source."""
     r = retouch
-    return f"|hair{int(r.dust_remove)}_{round(float(r.dust_threshold), 3)}_{int(r.dust_size)}_{int(r.ir_dust_remove)}_{round(float(r.ir_threshold), 3)}"
+    return (
+        f"|hair{int(r.dust_remove)}_{round(float(r.dust_threshold), 3)}_{int(r.dust_size)}_{int(r.ir_dust_remove)}_{round(float(r.ir_threshold), 3)}"
+        + exclusion_token(r)
+    )
 
 
 def repair_coverage(

@@ -10,11 +10,15 @@ from negpy.desktop.session import DesktopSessionManager
 from negpy.desktop.view.main_window import MainWindow
 from negpy.features.flatfield.logic import set_gain_provider
 from negpy.infrastructure.storage.repository import StorageRepository
+from negpy.services.assets.migrations.cast_removal import migrate_legacy_slide_cast_removal
 from negpy.services.assets.crosstalk import CrosstalkProfiles
 from negpy.services.assets.flatfield import FlatFieldProfiles
-from negpy.services.assets.flatfield_migration import migrate_legacy_flatfield_profiles
+from negpy.services.assets.migrations.flatfield import migrate_legacy_flatfield_profiles
 from negpy.services.assets.gear import GearProfiles
-from negpy.services.assets.gear_preset_migration import migrate_gear_presets
+from negpy.services.assets.migrations.gear_presets import migrate_gear_presets
+from negpy.services.assets.migrations.normalization_roll import migrate_legacy_normalization_rolls
+from negpy.services.assets.migrations.positive_auto import migrate_auto_meter_for_positive_frames
+from negpy.services.assets.migrations.roll_fields import migrate_baseline_card_split, migrate_new_roll_field_locks
 from negpy.kernel.system.config import APP_CONFIG, BASE_USER_DIR
 from negpy.kernel.system.logging import get_logger, setup_logging
 from negpy.kernel.system.override import apply as apply_override
@@ -54,7 +58,7 @@ class _AppStyle(QProxyStyle):
     the moment the cursor crosses a toolbar, which reads as noise — and no mnemonic
     underlines on macOS, where they mark a key that does nothing."""
 
-    _TOOLTIP_WAKEUP_MS = 1400
+    _TOOLTIP_WAKEUP_MS = 900
 
     def styleHint(self, hint, option=None, widget=None, returnData=None):
         if hint == QStyle.StyleHint.SH_ToolTip_WakeUpDelay:
@@ -251,6 +255,11 @@ def main() -> None:
         set_gain_provider(FlatFieldProfiles.load_gain)
         migrate_legacy_flatfield_profiles(repo)
         migrate_gear_presets(repo)
+        migrate_legacy_normalization_rolls(repo)
+        migrate_auto_meter_for_positive_frames(repo)
+        migrate_legacy_slide_cast_removal(repo)
+        migrate_baseline_card_split(repo)
+        migrate_new_roll_field_locks(repo)
 
         scale = float(repo.get_global_setting("ui_scale", 1.0) or 1.0)
         scale = max(0.8, min(1.2, scale))

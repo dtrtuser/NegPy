@@ -1,5 +1,6 @@
 import math
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from typing import List, NamedTuple, Optional, Tuple
 
 import cv2
@@ -1829,6 +1830,71 @@ def map_point_keystone(px: float, py: float, converge_v: float, converge_h: floa
     )
 
 
+_CROP_TO_VALID_ITERS = 30
+_CROP_TO_VALID_TERNARY_ITERS = 25
+
+
+@lru_cache(maxsize=32)
+def compute_geometry_crop_rect(
+    fine_rotation: float, converge_v: float, converge_h: float, w: int, h: int
+) -> Tuple[float, float, float, float]:
+    """Largest axis-aligned, frame-centered rect, normalized to the frame, that avoids
+    the replicated edges fine rotation and keystone (Tilt/Swing) leave behind. Distortion
+    correction is excluded: compute_distortion_scale already keeps it void-free by
+    scaling to fill.
+
+    Fine rotation and keystone are each a plane projectivity, so the source rect's
+    forward-mapped boundary is a convex quadrilateral: a candidate rect is valid iff its
+    four corners are (convexity needs no denser a sample), and the largest-area rect at a
+    fixed half-width is unimodal in that half-width. Ternary-searches the half-width, with
+    a nested binary search for the largest valid half-height at each candidate — mirroring
+    compute_distortion_scale's numeric style, one dimension up.
+    """
+    if abs(fine_rotation) < 1e-9 and abs(converge_v) < _KEYSTONE_EPS and abs(converge_h) < _KEYSTONE_EPS:
+        return 0.0, 0.0, 1.0, 1.0
+
+    cx, cy = w / 2.0, h / 2.0
+    rot = cv2.getRotationMatrix2D((cx, cy), fine_rotation, 1.0)
+    m_rot = np.vstack([rot, [0.0, 0.0, 1.0]])
+    m_combined = keystone_matrix(converge_v, converge_h, w, h) @ m_rot
+    m_inv = np.linalg.inv(m_combined)
+
+    def source_valid(x: float, y: float) -> bool:
+        p = m_inv @ np.array([x, y, 1.0])
+        if abs(p[2]) < 1e-12:
+            return False
+        sx, sy = p[0] / p[2], p[1] / p[2]
+        return -1e-6 <= sx <= (w - 1) + 1e-6 and -1e-6 <= sy <= (h - 1) + 1e-6
+
+    def corners_valid(hw: float, hh: float) -> bool:
+        return all(source_valid(cx + dx, cy + dy) for dx in (-hw, hw) for dy in (-hh, hh))
+
+    max_hw, max_hh = cx, cy
+
+    def hh_max(hw: float) -> float:
+        lo, hi = 0.0, max_hh
+        for _ in range(_CROP_TO_VALID_ITERS):
+            mid = 0.5 * (lo + hi)
+            if corners_valid(hw, mid):
+                lo = mid
+            else:
+                hi = mid
+        return lo
+
+    lo_w, hi_w = 0.0, max_hw
+    for _ in range(_CROP_TO_VALID_TERNARY_ITERS):
+        m1 = lo_w + (hi_w - lo_w) / 3.0
+        m2 = hi_w - (hi_w - lo_w) / 3.0
+        if m1 * hh_max(m1) < m2 * hh_max(m2):
+            lo_w = m1
+        else:
+            hi_w = m2
+    hw = 0.5 * (lo_w + hi_w)
+    hh = hh_max(hw)
+
+    return (cx - hw) / w, (cy - hh) / h, (cx + hw) / w, (cy + hh) / h
+
+
 def keystone_inverse_normalized(converge_v: float, converge_h: float) -> np.ndarray:
     """The keystone's inverse (corrected -> source), which the shader consumes directly
     rather than rebuilding the quad. Identity when both are zero."""
@@ -2317,6 +2383,29 @@ def rotate_normalized_rect(
     return (min(xs), min(ys), max(xs), max(ys))
 
 
+def rotate_geometry_and_analysis(
+    geo: GeometryConfig,
+    analysis_rect: Optional[Tuple[float, float, float, float]],
+    direction: int,
+) -> Tuple[GeometryConfig, Optional[Tuple[float, float, float, float]]]:
+    """
+    Applies a visual quarter-turn (the toolbar's labelled direction) to a frame's
+    own geometry, crop rect and analysis rect. `direction` is +1/-1 quarter-turns
+    CCW as seen on screen; a mirror inverts pipeline rotation handedness, so the
+    stored `rotation` field turns the opposite way under a flip while the crop and
+    analysis rects, being display-space, always turn by `direction`. Takes and
+    returns the two WorkspaceConfig fields separately, not the config itself: a
+    WorkspaceConfig import here would be the only one under features/, and the
+    reverse import already runs domain.models -> geometry.models.
+    """
+    pipeline_direction = -direction if geo.flip_horizontal != geo.flip_vertical else direction
+    new_geo = replace(geo, rotation=(geo.rotation + pipeline_direction) % 4)
+    if geo.crop_rect is not None:
+        new_geo = replace(new_geo, crop_rect=rotate_normalized_rect(geo.crop_rect, direction))
+    new_rect = rotate_normalized_rect(analysis_rect, direction) if analysis_rect is not None else None
+    return new_geo, new_rect
+
+
 def toggle_flip(geo: GeometryConfig, horizontal: bool) -> GeometryConfig:
     """
     Toggles a mirror on the geometry so the result is an exact mirror of the
@@ -2336,6 +2425,23 @@ def toggle_flip(geo: GeometryConfig, horizontal: bool) -> GeometryConfig:
     if geo.crop_rect is not None:
         new_geo = replace(new_geo, crop_rect=mirror_normalized_rect(geo.crop_rect, horizontal))
     return new_geo
+
+
+def flip_geometry_and_analysis(
+    geo: GeometryConfig,
+    analysis_rect: Optional[Tuple[float, float, float, float]],
+    horizontal: bool,
+) -> Tuple[GeometryConfig, Optional[Tuple[float, float, float, float]]]:
+    """
+    Mirrors a frame's own geometry and analysis rect across its vertical
+    (horizontal=True) or horizontal axis. The freehand analysis region is
+    transformed-space like the crop rect toggle_flip already mirrors, so it keeps
+    reading the same picture content. See rotate_geometry_and_analysis for why
+    this takes the two fields separately rather than a WorkspaceConfig.
+    """
+    new_geo = toggle_flip(geo, horizontal)
+    new_rect = mirror_normalized_rect(analysis_rect, horizontal) if analysis_rect is not None else None
+    return new_geo, new_rect
 
 
 def straighten_delta_degrees(dx: float, dy: float) -> float:

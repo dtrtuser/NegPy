@@ -172,7 +172,10 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(600, self.show_scan_setup)
 
     def _restore_window_geometry(self) -> None:
-        """Open clamped to the screen work area, restoring the saved size/position if any."""
+        """Restore the window state and geometry, with a legacy size/position fallback."""
+        encoded = self.controller.session.repo.get_global_setting("window_geometry_qt")
+        if isinstance(encoded, str) and self.restoreGeometry(QByteArray.fromBase64(encoded.encode("utf-8"))):
+            return
         screen = QApplication.primaryScreen()
         if screen is None:
             self.resize(_DEFAULT_W, _DEFAULT_H)
@@ -190,10 +193,10 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         try:
-            # normalGeometry, so a maximized window reopens maximized over its own restored size.
-            geo = self.normalGeometry() if self.isMaximized() else self.geometry()
+            geo = self.normalGeometry() if self.isMaximized() or self.isFullScreen() else self.geometry()
             self.controller.session.repo.save_global_settings(
                 {
+                    "window_geometry_qt": bytes(self.saveGeometry().toBase64()).decode("ascii"),
                     "window_geometry": [geo.x(), geo.y(), geo.width(), geo.height()],
                     "window_maximized": self.isMaximized(),
                     "dock_state": bytes(self.saveState().toBase64()).decode("ascii"),
@@ -460,6 +463,7 @@ class MainWindow(QMainWindow):
         self.canvas.analysis_confirmed.connect(self.controller.confirm_analysis_region)
         self.canvas.local_mask_created.connect(self.controller.handle_local_mask_created)
         self.canvas.scratch_completed.connect(self.controller.handle_heal_stroke_completed)
+        self.canvas.dust_exclusion_painted.connect(self.controller.handle_dust_exclusion_painted)
         self.canvas.straighten_completed.connect(self.controller.handle_straighten_completed)
         self.canvas.zone_pin_moved.connect(self.controller.move_zone_pin)
         self.canvas.zone_placement_confirmed.connect(self.controller.apply_zone_placement)
@@ -475,7 +479,9 @@ class MainWindow(QMainWindow):
         self.controller.tool_sync_requested.connect(self._sync_tool_buttons)
         self.controller.config_updated.connect(self.canvas.overlay.update)
         self.controller.analysis_buffer_preview_requested.connect(self.canvas.overlay.show_analysis_buffer)
+        self.controller.analysis_buffer_drag_changed.connect(self.canvas.overlay.set_analysis_buffer_dragging)
         self.controller.rotation_guide_requested.connect(self.canvas.overlay.show_rotation_grid)
+        self.controller.rotation_guide_requested.connect(self.canvas.overlay.show_crop_preview)
         self.controller.crop_guide_changed.connect(self.canvas.overlay.update)
         self.controller.dust_overlay_changed.connect(self.canvas.overlay.update)
         self.controller.zones_overlay_changed.connect(lambda _on: self.canvas.overlay.update())

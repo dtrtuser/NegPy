@@ -1,5 +1,51 @@
 # Change Log
 
+## 0.60.0
+
+- New: **Rolls and the Roll tab** — the Library is a list of rolls: folder rolls, color-coded, and virtual rolls built from any frames. A photo in more than one roll can get its own edit per roll. The Roll tab holds roll-wide defaults for Film Mode, Frame Assembly (Trichrome, Half Frame with per-roll auto-detect), Calibration, Crop, Raw Decode, Optics, Roll Analysis, Metering and Metadata. Every card header has a Frame/Roll switch, and a frame you change is locked on that card until Apply pushes it back. Presets move to Favorites, and the export destination defaults to a subfolder of the roll. @PabloRuizCuevas
+- New: **Scenes** — group frames of a roll into a scene with its own normalization baseline; Batch Analysis is now Roll Analysis. Baselines compare whole frames, and a frame far from the rest keeps its own bounds.
+- New: **Roll-wide Cast Removal** — Roll and Scene Analysis also measure each frame's gray balance. With Use Average: Cast on, the frames of a roll or scene share its color curve, and each frame keeps its own midtone level. Color Negative only. Cast Removal defaults to 1.0 on Color Negative; existing edits keep their saved strength.
+- New: **Roll Settings… and Search by meaning** — tag gear and capture metadata across a frame, a selection or a roll, with camera, film stock, ISO and date suggested from the folder name. Search is an opt-in CLIP search across a roll or the whole library. @PabloRuizCuevas
+- New: **Embedded lens correction for Sony ARW and DNG** — separate Distortion and CA toggles from the file's own metadata. @hsnilsson
+- New: **Exclude areas from Optical Removal** — right-drag paints a band the detector leaves alone. @s6stkurz
+- New: **More controls on Slide** — highlight reconstruction (Off / Blend / Reconstruct), Dye Separation and Separation Damping without Normalize, and White/Black Point on the transfer path. @thetalkingdrum
+- New: **Batch edits across the Film Strip** — rotate and flip turn every selected frame, Reset Roll to Defaults… undoes a setting pushed to the whole roll, and thumbnails of edited frames refresh in the background (plus a manual Update Thumbnails). @thetalkingdrum
+- New: **Master switch for carrying settings to a new frame.** @PabloRuizCuevas
+- New: **Tone Limit on Dodge & Burn masks** — a mask can act only on tones lighter or darker than a zone of the print, like a lith mask, so a sky burn stops at the skyline. Invert moves to a toggle on each mask row.
+- Change: **Positive is a Slide-only setting** and applies to the whole roll; Auto Density and Auto Grade work on it. @PabloRuizCuevas
+- Change: **Faster, lighter navigation** — Film Strip previews stream in the background with bounded memory, and neighbor prefetch works again on scan TIFFs and camera RAWs. @hsnilsson
+- Change: **User Guide and Pipeline docs rewritten** — shorter and plainer, including the in-app ⓘ guides.
+- Fix: **Correct defaults everywhere** — new files and resets use the calibrated grade, crosstalk and auto crop. On a slide, Cast Removal keeps the value you set, and reset and Before/After use the slide default of 0. @thetalkingdrum
+- Fix: **Slide Shadows/Highlights color balance works.** @thetalkingdrum
+- Fix: **RAW decode clips at the camera's calibrated white level.** @thetalkingdrum
+- Fix: **Shift/Ctrl-click multi-select in the Film Strip is reliable.** @thetalkingdrum
+- Fix: **Small UI fixes** — the Analysis Buffer overlay stays visible while its slider is held, and the spinner shows on a slow reload. @thetalkingdrum
+- Fix: **Hot Folder no longer offers a rejected duplicate again.** @PabloRuizCuevas
+
+## 0.59.0
+
+- New: **Per-frame registration in the Coolscan strip preview** — every frame tile gets its own offset slider on top of the roll-wide Offset and Drift, for a splice or a mis-fired advance; tiles gain a size slider, the detected boundary is outlined in the accent color, a measured strip finds its frames as the dialog opens, and a moved offset re-cuts the tile. Needs nkscan 0.11.0, which also fixes tile pitch and low-DPI scans on the LS-5000.
+- New: **TIFF (mono) scan format** — one 16-bit gray plane for single-record film, a third the size; NegPy reads its own mono scans back.
+- New: **Positive** — a Process toggle beside Normalize for a source that is already a finished positive: it decodes the file's own profile and skips the as-captured lift and highlight roll-off. @PabloRuizCuevas
+- New: **Per-frame half-frame splits** — a scan can use its own detected gutter or a hand-set one, applied to the current, selected or all frames; heal strokes, spots, lines and masks re-anchor across a split or crop change. @PabloRuizCuevas
+- New: **Peek Embedded Preview** — the camera's own JPEG of the capture, as an outside reference for the decode; every peek now badges the canvas, checks in the menu, and leaves with Esc. @seanharding
+- New: **Per-mask enable/disable** — click a mask's shape icon in Dodge & Burn to suppress it without deleting it; the tint overlay and Printing Notes skip it. @thetalkingdrum
+- Change: **DNG scan output retired** — scans write TIFF; reading LinearRaw DNGs is unchanged.
+- Change: **UI consistency pass** — toasts colored by severity and a failed export no longer blanks the canvas, a GPU viewport that fails to start says so and falls back to CPU, dock layout and active tab survive a restart, one Enter target per dialog, one section factory with a ⓘ guide, every color and size from the theme, one spelling and casing scheme, and the keyboard docs and tutorial read the shortcut registry.
+- Change: **Fast interactive geometry drags** — fine rotation, keystone and the crop tool no longer drop to the CPU engine or re-measure the frame per step. @PabloRuizCuevas
+- Change: **Painted heal strokes bake incrementally** — a new stroke no longer re-runs every earlier one. @PabloRuizCuevas
+- Change: **Lower memory for Linear DNG decoding and CPU export.** @hsnilsson
+- Fix: **Optical Removal's Threshold reaches past 12σ** — the top of the slider now runs to 48σ, where a specular highlight or a rail edge sits, so those can be gated out; a setting at or below the default renders as before.
+- Fix: **Stale Narrowband flag tinted a slide green** — the flag is now inert on a transparency everywhere. @seanharding
+- Fix: **Peek Negative renders the way the negative looks** — as-shot multipliers fold in and the view gets a brightness level, so an orange mask reads as one. @seanharding
+- Fix: **Linear Output records the demosaic algorithm it ran.** @thetalkingdrum
+- Fix: **Arrow keys step a slider by its declared step** — fractional sliders moved by 1/precision, so a Grade press moved 0.01 ISO-R. @PabloRuizCuevas
+- Fix: **No traceback while dragging Border Width** — a retired texture could be drawn from between frames. @dtrtuser
+- Fix: **Filename and contact-sheet path fields keep the cursor while typing.** @TobbyTravel
+- Fix: **Scanlight v4b recognized** — the newer v4 PCB has white LEDs, so the W slider and the White Light preset work. @ianfyffe
+- Fix: **JPEG exports with GPS or PrintImageMatching tags are readable** — high-numbered camera tags broke IFD0 order and the dates and coordinates after it. @jihorba
+- Fix: **Exported files carry the source's filesystem dates** — mtime, and the creation date on macOS. @jihorba
+
 ## 0.58.0
 
 - New: **Print tone grounded in the photofinishing literature** — the default print envelope, Auto Grade and Auto Density were retuned against published preferred-reproduction data; both meters now read textured parts of the frame only, so rebate, sky and flat walls no longer set grade or exposure. **Retune your Auto Grade and Auto Density targets** — existing frames on the automatic helpers will print differently.

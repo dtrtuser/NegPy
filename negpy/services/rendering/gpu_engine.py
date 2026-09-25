@@ -17,6 +17,7 @@ from negpy.features.exposure import models as exposure_models
 from negpy.features.exposure.normalization import (
     LogNegativeBounds,
     analyze_log_exposure_bounds_from_log,
+    blend_neutral_axis,
     contrast_mask_plane,
     luma_source_bounds,
     normalized_roi,
@@ -42,6 +43,7 @@ from negpy.features.geometry.logic import (
     apply_margin_to_roi,
     apply_radial_distortion,
     compute_distortion_scale,
+    compute_geometry_crop_rect,
     get_manual_rect_coords,
 )
 from negpy.features.geometry.models import GeometryConfig
@@ -50,20 +52,25 @@ from negpy.features.lab.models import SharpenMethod
 from negpy.features.altprocess.models import AltProcess
 from negpy.features.cyanotype.logic import CYANOTYPE_CONSTANTS, sensitizer_constants
 from negpy.features.lith.logic import LITH_CONSTANTS
-from negpy.features.local.logic import compute_local_maps
+from negpy.features.exposure.placement import limited_mask_params
+from negpy.features.local.logic import compute_local_maps, limited_masks
+from negpy.features.local.models import MAX_KEYED_MASKS
 from negpy.features.exposure.transfer import (
     TRANSFER_CONSTANTS,
     ZONE_BLACK_TAPER,
     TRANSFER_DENSITY_RANGE,
-    is_transparency_transfer,
+    is_transfer_path,
+    transfer_assumed_anchor,
+    transfer_auto_terms,
     transfer_bounds,
     transfer_curve_params,
     transfer_widths,
+    wb_split_geometry,
     zone_geometry,
 )
 from negpy.features.process.capture_color import apply_camera_matrix, camera_to_working_matrix
 from negpy.features.process.logic import should_fold_camera_wb
-from negpy.features.process.models import ProcessMode, per_channel_point_offsets
+from negpy.features.process.models import ProcessMode, per_channel_point_offsets, pooled_neutral_axis
 from negpy.infrastructure.gpu.device import GPUDevice
 from negpy.infrastructure.gpu.resources import GPUBuffer, GPUTexture
 from negpy.infrastructure.gpu.shader_loader import ShaderLoader
@@ -92,6 +99,8 @@ TILE_SIZE = 2048
 # APUs) have ample real VRAM and don't need -- or want -- the export slowed down for it.
 TILE_SIZE_LOW_VRAM = 1024
 TILE_HALO = 32
+# A direct frame keeps an image-size rgba32float texture chain for stage resume.
+# Above this pixel count, tiling bounds the complete working set.
 TILING_THRESHOLD_PX = 12_000_000
 HISTOGRAM_BINS = 256
 # Metrics buffer layout in u32 words: RGBL output histogram (metrics.wgsl), the RGBL
@@ -208,6 +217,8 @@ def _analysis_cache_key(settings: WorkspaceConfig, analysis_source_hash: str) ->
         p.crosstalk_strength,
         p.crosstalk_matrix,
         p.crosstalk_process,
+        p.use_cast_average,
+        p.locked_neutral_axis,
         g.rotation,
         g.flip_horizontal,
         g.flip_vertical,
@@ -310,12 +321,12 @@ class GPUEngine:
             "density_hist",
         ]
         # Packed byte size per stage. A stage that exceeds the 256B dynamic-offset
-        # alignment (exposure, 336B) occupies multiple aligned slots.
+        # alignment (exposure, 416B) occupies multiple aligned slots.
         self._uniform_sizes = {
             "geometry": 64,
             "normalization": 160,
-            "exposure": 336,
-            "transfer": 176,
+            "exposure": 416,
+            "transfer": 224,
             "clahe_u": 32,
             "lab": 96,
             "lith": 64,
@@ -456,6 +467,29 @@ class GPUEngine:
                 tex.destroy()
         # Bind groups keyed by id() never match a destroyed view again; drop, don't leak.
         self._bind_group_cache.clear()
+
+    def requires_tiling(self, img: np.ndarray, settings: WorkspaceConfig) -> bool:
+        """True when a direct texture chain exceeds a device or working-set limit."""
+        h, w = img.shape[:2]
+        max_tex = self.gpu.limits.get("max_texture_dimension_2d", 8192)
+        if APP_CONFIG.max_texture_size is not None:
+            max_tex = min(max_tex, APP_CONFIG.max_texture_size)
+        rot = settings.geometry.rotation % 4
+        w_rot, h_rot = (h, w) if rot in (1, 3) else (w, h)
+        return w_rot > max_tex or h_rot > max_tex or w * h > TILING_THRESHOLD_PX
+
+    def _release_texture_pool(self, retain: Optional[GPUTexture] = None) -> None:
+        """Destroy pooled textures after their submitted work is complete."""
+        for tex in self._tex_cache.values():
+            if tex is not retain:
+                tex.destroy()
+        self._tex_cache.clear()
+        self._tex_gen.clear()
+        self._bind_group_cache.clear()
+        self._current_source_hash = None
+        self._last_settings = None
+        self._local_ev_key = None
+        self._mask_tex_key = None
 
     def _init_resources(self) -> None:
         """Initializes hardware pipelines and persistent buffers."""
@@ -621,6 +655,13 @@ class GPUEngine:
                     offset_px=settings.geometry.autocrop_offset,
                     scale_factor=scale_factor,
                 )
+            elif settings.geometry.crop_to_valid and not settings.geometry.crop_from_auto:
+                valid_rect = compute_geometry_crop_rect(
+                    settings.geometry.fine_rotation, settings.geometry.converge_v, settings.geometry.converge_h, w_rot, h_rot
+                )
+                roi = get_manual_rect_coords(
+                    (h_rot, w_rot), valid_rect, offset_px=settings.geometry.autocrop_offset, scale_factor=scale_factor
+                )
             elif settings.geometry.autocrop_offset > 0:
                 margin = settings.geometry.autocrop_offset * scale_factor
                 roi = apply_margin_to_roi((0, h_rot, 0, w_rot), h_rot, w_rot, margin)
@@ -667,13 +708,29 @@ class GPUEngine:
         _roll_luma = settings.process.use_luma_average and settings.process.is_locked_initialized
         _roll_color = settings.process.use_color_average and settings.process.is_locked_initialized
         needs_bounds_analysis = not (bounds_override or (_roll_luma and _roll_color) or settings.process.is_local_initialized)
+        transfer = is_transfer_path(settings.process.process_mode, settings.process.e6_normalize, settings.process.positive_source)
+        # A raw un-normalized slide never meters -- these four stay unmeasured for it,
+        # the same guarantee is_transfer_path exists to give a bracket. A Positive frame
+        # carries no such bracket, so it meters exactly like a negative.
+        transfer_meters_ok = not transfer or settings.process.positive_source
         # Measure the anchor for the render when Auto Density is on, and for the
         # Analysis-panel stats on every preview whatever the toggle says. The render only
         # *uses* it when auto_exposure is on (see uniforms).
-        needs_anchor = metered_anchor_override is None and not tiling_mode and (settings.exposure.auto_exposure or readback_metrics)
-        needs_textural = textural_range_override is None and not tiling_mode and settings.exposure.auto_normalize_contrast
-        needs_shadow = shadow_point_override is None and not tiling_mode and settings.exposure.auto_normalize_contrast
-        needs_highlight = highlight_point_override is None and not tiling_mode and settings.exposure.auto_normalize_contrast
+        needs_anchor = (
+            metered_anchor_override is None
+            and not tiling_mode
+            and (settings.exposure.auto_exposure or readback_metrics)
+            and transfer_meters_ok
+        )
+        needs_textural = (
+            textural_range_override is None and not tiling_mode and settings.exposure.auto_normalize_contrast and transfer_meters_ok
+        )
+        needs_shadow = (
+            shadow_point_override is None and not tiling_mode and settings.exposure.auto_normalize_contrast and transfer_meters_ok
+        )
+        needs_highlight = (
+            highlight_point_override is None and not tiling_mode and settings.exposure.auto_normalize_contrast and transfer_meters_ok
+        )
 
         prefiltered = None
         cam_prefiltered = None
@@ -683,7 +740,6 @@ class GPUEngine:
         unmix_m = effective_crosstalk_matrix(settings.process, settings.process.process_mode)
         # The transparency curve reads working space, so its meter must too: the same
         # camera matrix NormalizationProcessor._process_transparency applies, on the grid.
-        transfer = is_transparency_transfer(settings.process.process_mode, settings.process.e6_normalize)
         cam_m = (
             camera_to_working_matrix(
                 cam_xyz, camera_wb if should_fold_camera_wb(settings.process, settings.exposure.render_intent) else None
@@ -793,22 +849,32 @@ class GPUEngine:
         if needs_axis and axis_grid is not None:
             axis_bounds = LogNegativeBounds(*transfer_bounds()) if transfer else bounds
             neutral_axis_refs = measure_neutral_axis_from_log(axis_grid, axis_bounds, None, 0.0)
+            pooled_axis = pooled_neutral_axis(settings.process)
+            if pooled_axis is not None:
+                neutral_axis_refs = blend_neutral_axis(neutral_axis_refs, pooled_axis)
+
+        # Auto Density/Auto Grade meter the working-space grid against the fixed window on
+        # a Positive frame, exactly like the neutral axis just above; both read the
+        # regular per-frame grid/bounds everywhere else.
+        meter_grid = cam_prefiltered if transfer else prefiltered
+        meter_bounds = LogNegativeBounds(*transfer_bounds()) if transfer else anchor_bounds
+        meter_assumed = transfer_assumed_anchor() if transfer else None
 
         metered_anchor = metered_anchor_override
-        if needs_anchor and prefiltered is not None:
-            metered_anchor = measure_anchor_from_log(prefiltered, anchor_bounds, None, 0.0)
+        if needs_anchor and meter_grid is not None:
+            metered_anchor = measure_anchor_from_log(meter_grid, meter_bounds, None, 0.0, assumed=meter_assumed)
 
         textural_range = textural_range_override
-        if needs_textural and prefiltered is not None:
-            textural_range = measure_textural_range_from_log(prefiltered, None, 0.0)
+        if needs_textural and meter_grid is not None:
+            textural_range = measure_textural_range_from_log(meter_grid, None, 0.0)
 
         shadow_point = shadow_point_override
-        if needs_shadow and prefiltered is not None:
-            shadow_point = measure_shadow_point_from_log(prefiltered, anchor_bounds, None, 0.0)
+        if needs_shadow and meter_grid is not None:
+            shadow_point = measure_shadow_point_from_log(meter_grid, meter_bounds, None, 0.0)
 
         highlight_point = highlight_point_override
-        if needs_highlight and prefiltered is not None:
-            highlight_point = measure_highlight_point_from_log(prefiltered, anchor_bounds, None, 0.0)
+        if needs_highlight and meter_grid is not None:
+            highlight_point = measure_highlight_point_from_log(meter_grid, meter_bounds, None, 0.0)
 
         if analysis_key is not None:
             self._analysis_cache = _update_analysis_cache(
@@ -989,6 +1055,14 @@ class GPUEngine:
                 wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
                 "local_ev",
             )
+        # Tone-limited masks' shape alphas; the same 1x1 dummy when there is none (key_meta.x
+        # gates it).
+        key_size = (w_rot, h_rot) if limited_masks(settings.local) else (1, 1)
+        tex_local_key = self._get_intermediate_texture(
+            *key_size,
+            wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
+            "local_key",
+        )
         tex_toning = self._get_intermediate_texture(
             crop_w,
             crop_h,
@@ -1065,20 +1139,25 @@ class GPUEngine:
                     if local_maps is None:
                         local_maps = np.zeros((h_rot, w_rot, 2), dtype=np.float32)
                     ev_plane = local_maps[:, :, 0]
-                    # r = dodge/burn EV, g = local grade slope factor, b unused. One texture,
-                    # so the local-grade map costs no bind slot.
+                    # r = dodge/burn EV, g = local grade slope factor, b = its ISO-R deltas,
+                    # which tone-limited masks add their grade to. One texture, so the
+                    # local-grade map costs no bind slot.
                     tex_local_ev.upload(
                         np.dstack(
                             [
                                 ev_plane,
                                 local_grade_factor_map(local_maps[:, :, 1], settings.exposure.grade),
-                                np.zeros_like(ev_plane),
+                                local_maps[:, :, 1],
                             ]
                         )
                     )
+                    if local_maps.shape[2] > 2:
+                        planes = np.zeros((*ev_plane.shape, MAX_KEYED_MASKS), dtype=np.float32)
+                        planes[:, :, : local_maps.shape[2] - 2] = local_maps[:, :, 2:]
+                        tex_local_key.upload(planes)
                     # A tiled export passes a per-tile slice, which is not reusable.
                     self._local_ev_key = None if tiled_maps else ev_key
-            if is_transparency_transfer(settings.process.process_mode, settings.process.e6_normalize):
+            if is_transfer_path(settings.process.process_mode, settings.process.e6_normalize, settings.process.positive_source):
                 # The transfer curve takes no dodge/burn map: local EV is a print-exposure
                 # input, and this path replaces the print.
                 self._dispatch_pass(
@@ -1102,6 +1181,7 @@ class GPUEngine:
                         (2, self._get_uniform_binding("exposure")),
                         (3, tex_local_ev.view),
                         (4, tex_mask.view),
+                        (5, tex_local_key.view),
                     ],
                     w_rot,
                     h_rot,
@@ -1357,10 +1437,12 @@ class GPUEngine:
 
         device.queue.submit([enc.finish()])
         # The exact stretch the shader normalized with (mirrors the CPU "final_bounds").
+        # The transfer path renders through the fixed window, not the measured one.
+        _base_bounds = LogNegativeBounds(*transfer_bounds()) if transfer else bounds
         _wp3, _bp3 = per_channel_point_offsets(settings.process, settings.process.process_mode == ProcessMode.E6)
         final_bounds = LogNegativeBounds(
-            floors=(bounds.floors[0] + _wp3[0], bounds.floors[1] + _wp3[1], bounds.floors[2] + _wp3[2]),
-            ceils=(bounds.ceils[0] + _bp3[0], bounds.ceils[1] + _bp3[1], bounds.ceils[2] + _bp3[2]),
+            floors=tuple(f + wp for f, wp in zip(_base_bounds.floors, _wp3)),
+            ceils=tuple(c + bp for c, bp in zip(_base_bounds.ceils, _bp3)),
         )
         metrics: Dict[str, Any] = {
             "active_roi": roi,
@@ -1498,11 +1580,13 @@ class GPUEngine:
         adj_floors = (f[0] + wp3[0], f[1] + wp3[1], f[2] + wp3[2])
         adj_ceils = (c[0] + bp3[0], c[1] + bp3[1], c[2] + bp3[2])
 
-        # Transparency transfer: the fixed window, with no WP/BP trims. Mirrors
-        # NormalizationProcessor._process_transparency, whose identity they would break.
-        if is_transparency_transfer(settings.process.process_mode, settings.process.e6_normalize):
+        # Transparency transfer uses the fixed window, deviated by White/Black Point as the
+        # measured path above is. That nudge is user-driven rather than metered, so it keeps
+        # identity at wp3=bp3=0. Mirrors NormalizationProcessor._process_transparency.
+        if is_transfer_path(settings.process.process_mode, settings.process.e6_normalize, settings.process.positive_source):
             t_floors, t_ceils = transfer_bounds()
-            adj_floors, adj_ceils = t_floors, t_ceils
+            adj_floors = (t_floors[0] + wp3[0], t_floors[1] + wp3[1], t_floors[2] + wp3[2])
+            adj_ceils = (t_ceils[0] + bp3[0], t_ceils[1] + bp3[1], t_ceils[2] + bp3[2])
 
         # Capture-side dye-unmix rows, resolved once per frame by the caller and shared
         # with NormalizationProcessor. Identity when off.
@@ -1527,7 +1611,11 @@ class GPUEngine:
             + struct.pack(
                 "IIff",
                 mode_val,
-                (1 if settings.process.e6_normalize else 0),
+                (
+                    1
+                    if is_transfer_path(settings.process.process_mode, settings.process.e6_normalize, settings.process.positive_source)
+                    else 0
+                ),
                 0.0,
                 0.0,
             )
@@ -1560,13 +1648,20 @@ class GPUEngine:
 
         # Transparency transfer params (mirrors transfer.py; inert on the print path).
         tc = TRANSFER_CONSTANTS
-        t_exp, t_contrast, t_toe3, t_sh3 = transfer_curve_params(settings.exposure)
+        t_exp0, t_contrast0, t_toe3, t_sh3 = transfer_curve_params(settings.exposure)
+        # Auto Density/Auto Grade, restated on this curve -- inert (None inputs) on a raw
+        # un-normalized slide, live on a Positive frame exactly like on a negative.
+        t_exp, t_contrast, t_hl_auto = transfer_auto_terms(
+            settings.exposure, t_exp0, t_contrast0, textural_range, metered_anchor, shadow_point, highlight_point
+        )
         t_tw3, t_sw3 = transfer_widths(settings.exposure)
         t_cmy = filtration_offsets(
             (settings.exposure.wb_cyan, settings.exposure.wb_magenta, settings.exposure.wb_yellow),
             LogNegativeBounds(floors=adj_floors, ceils=adj_ceils),
         )
         t_sh_c, t_hi_c, t_zone_k = zone_geometry()
+        t_wb_c, t_wb_k = wb_split_geometry()
+        t_cmy_m = EXPOSURE_CONSTANTS["cmy_max_density"]
         # Cast Removal on the transparency curve: a per-channel affine on density, since
         # this curve has no per-channel slope to re-solve. Shadow refs stay out — the P98
         # tie is calibrated for a negative. Identity when there is no axis.
@@ -1581,6 +1676,23 @@ class GPUEngine:
         # the shader to skip display_rendering too. Matches transfer.py.
         t_positive_source = bool(settings.process.positive_source)
         t_baseline_gain = 1.0 if t_positive_source else 2.0 ** float(tc["transfer_baseline_ev"])
+        # Dye Separation on the transfer curve: same per-channel k3 as the print path,
+        # applied directly since there is no paper matrix here (see
+        # transfer.py::apply_transfer_curve).
+        t_is_bw = settings.process.process_mode == ProcessMode.BW
+        t_sep_k3 = (
+            (1.0, 1.0, 1.0)
+            if t_is_bw
+            else per_channel_dye_separation(
+                settings.exposure.dye_separation,
+                (
+                    settings.exposure.dye_separation_trim_red,
+                    settings.exposure.dye_separation_trim_green,
+                    settings.exposure.dye_separation_trim_blue,
+                ),
+            )
+        )
+        t_sep_damping = 0.0 if t_is_bw else float(settings.exposure.separation_damping)
         tr_data = (
             struct.pack(
                 "ffffffff",
@@ -1601,9 +1713,23 @@ class GPUEngine:
             + struct.pack(
                 "ffff",
                 float(settings.exposure.shadow_density),
-                float(settings.exposure.highlight_density),
+                float(settings.exposure.highlight_density + t_hl_auto),
                 float(t_sh_c),
                 float(t_hi_c),
+            )
+            + struct.pack(
+                "ffff",
+                settings.exposure.shadow_cyan * t_cmy_m,
+                settings.exposure.shadow_magenta * t_cmy_m,
+                settings.exposure.shadow_yellow * t_cmy_m,
+                float(t_wb_c),
+            )
+            + struct.pack(
+                "ffff",
+                settings.exposure.highlight_cyan * t_cmy_m,
+                settings.exposure.highlight_magenta * t_cmy_m,
+                settings.exposure.highlight_yellow * t_cmy_m,
+                float(t_wb_k),
             )
             + struct.pack("ffff", float(ZONE_BLACK_TAPER), 1.0 if t_positive_source else 0.0, 0.0, 0.0)
             + struct.pack("ffff", t_cast_gain[0], t_cast_gain[1], t_cast_gain[2], 0.0)
@@ -1614,6 +1740,7 @@ class GPUEngine:
                 t_cast_off[2] * TRANSFER_DENSITY_RANGE,
                 0.0,
             )
+            + struct.pack("ffff", t_sep_k3[0], t_sep_k3[1], t_sep_k3[2], t_sep_damping)
         )
         from negpy.features.exposure.papers import (
             compose_density_matrices,
@@ -1716,6 +1843,31 @@ class GPUEngine:
         dye = composed  # use_dye_mix (below) and dye_rows both key off this
         dye_rows = np.eye(3) if dye is None else dye
 
+        # Tone-limited masks keyed from the same metrics this render publishes, so the CPU
+        # kernel and the canvas tint pick the same pixels.
+        key_params = limited_mask_params(
+            settings.local,
+            exp,
+            settings.process.process_mode,
+            {
+                "final_bounds": LogNegativeBounds(adj_floors, adj_ceils),
+                "norm_density_range": lum_range,
+                "metered_anchor": metered_anchor,
+                "textural_range": textural_range,
+                "shadow_point": shadow_point,
+                "highlight_point": highlight_point,
+                "shadow_log_refs": shadow_refs,
+                "neutral_axis_refs": neutral_axis_refs,
+            },
+        )
+        key_rows = np.zeros((MAX_KEYED_MASKS, 4), dtype=np.float32)
+        if key_params is not None:
+            key_rows[: len(key_params)] = key_params
+        r_min, r_max = float(EXPOSURE_CONSTANTS["iso_r_min"]), float(EXPOSURE_CONSTANTS["iso_r_max"])
+        key_meta = struct.pack(
+            "ffff", 0.0 if key_params is None else float(len(key_params)), min(max(float(exp.grade), r_min), r_max), r_min, r_max
+        )
+
         # The w-lanes carry per-channel toe (first three vec4s) and shoulder (next three).
         # See the toe3/sh3 reads in exposure.wgsl.
         e_data = (
@@ -1792,6 +1944,8 @@ class GPUEngine:
             # origin and span in rotated pixels. The shader does the upscale.
             + struct.pack("ffff", *(contrast_mask[:3] if contrast_mask else (0.0, 0.0, 0.0)), 0.0)
             + struct.pack("ffff", *(contrast_mask[3:] if contrast_mask else (1.0, 1.0)), 0.0, 0.0)
+            + key_rows.tobytes()
+            + key_meta
         )
 
         cls = float(settings.lab.clahe_strength)
@@ -2233,15 +2387,13 @@ class GPUEngine:
         camera_wb: Optional[list] = None,
         source_hash: Optional[str] = None,
         analysis_source_hash: Optional[str] = None,
+        memory_bounded: bool = False,
+        render_size_ref: Optional[float] = None,
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
         """High-level processing entry point with automatic tiling."""
         self._init_resources()
         self.evict_stale_textures()
-        h, w = img.shape[:2]
-        max_tex = self.gpu.limits.get("max_texture_dimension_2d", 8192)
-        rot = settings.geometry.rotation % 4
-        w_rot, h_rot = (h, w) if rot in (1, 3) else (w, h)
-        if w_rot > max_tex or h_rot > max_tex or (w * h > TILING_THRESHOLD_PX):
+        if self.requires_tiling(img, settings):
             return self._process_tiled(
                 img,
                 settings,
@@ -2250,6 +2402,8 @@ class GPUEngine:
                 cam_xyz=cam_xyz,
                 camera_wb=camera_wb,
                 readback_metrics=readback_metrics,
+                memory_bounded=memory_bounded,
+                render_size_ref=render_size_ref,
             )
         tex_final, metrics = self.process_to_texture(
             img,
@@ -2261,6 +2415,7 @@ class GPUEngine:
             camera_wb=camera_wb,
             source_hash=source_hash,
             analysis_source_hash=analysis_source_hash,
+            render_size_ref=render_size_ref,
         )
         return self._readback_downsampled(tex_final), metrics
 
@@ -2273,9 +2428,15 @@ class GPUEngine:
         cam_xyz: Optional[list] = None,
         camera_wb: Optional[list] = None,
         readback_metrics: bool = True,
+        memory_bounded: bool = False,
+        render_size_ref: Optional[float] = None,
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
         """Processes ultra-high resolution images using memory-efficient tiling."""
         h, w = img.shape[:2]
+        transient_tiles = memory_bounded or APP_CONFIG.low_vram_export_tiling
+
+        if transient_tiles:
+            self._release_texture_pool()
 
         # Tiles apply geometry on the CPU (shader uniform zeroed), so distortion too.
         k1_eff = settings.geometry.distortion_k1
@@ -2329,6 +2490,12 @@ class GPUEngine:
 
         global_cdfs = self._readback_clahe_cdf()
 
+        if transient_tiles:
+            normalized_log = metrics_ref.get("normalized_log")
+            if isinstance(normalized_log, GPUTexture):
+                metrics_ref["normalized_log"] = np.ascontiguousarray(normalized_log.readback()[:, :, :3])
+            self._release_texture_pool()
+
         rot = settings.geometry.rotation % 4
         w_rot, h_rot = (h, w) if rot in (1, 3) else (w, h)
         if settings.geometry.crop_rect:
@@ -2338,6 +2505,11 @@ class GPUEngine:
                 offset_px=settings.geometry.autocrop_offset,
                 scale_factor=scale_factor,
             )
+        elif settings.geometry.crop_to_valid and not settings.geometry.crop_from_auto:
+            valid_rect = compute_geometry_crop_rect(
+                settings.geometry.fine_rotation, settings.geometry.converge_v, settings.geometry.converge_h, w_rot, h_rot
+            )
+            roi = get_manual_rect_coords((h_rot, w_rot), valid_rect, offset_px=settings.geometry.autocrop_offset, scale_factor=scale_factor)
         elif settings.geometry.autocrop_offset > 0:
             margin = settings.geometry.autocrop_offset * scale_factor
             roi = apply_margin_to_roi((0, h_rot, 0, w_rot), h_rot, w_rot, margin)
@@ -2404,7 +2576,7 @@ class GPUEngine:
         if settings.exposure.cast_removal_strength > 0.0 and settings.process.process_mode != ProcessMode.BW:
             if settings.process.process_mode == ProcessMode.C41:
                 global_shadow_refs = measure_shadow_refs_from_log(_prefiltered(), None, 0.0, sorted_grid=_sorted())
-            if is_transparency_transfer(settings.process.process_mode, settings.process.e6_normalize):
+            if is_transfer_path(settings.process.process_mode, settings.process.e6_normalize, settings.process.positive_source):
                 # Working space and the fixed window, as the transparency curve reads them.
                 cam_m = camera_to_working_matrix(
                     cam_xyz, camera_wb if should_fold_camera_wb(settings.process, settings.exposure.render_intent) else None
@@ -2452,7 +2624,7 @@ class GPUEngine:
             # One plane serves every tile; the first upload wins.
             self._mask_tex_key = None
 
-        paper_w, paper_h, content_w, content_h, off_x, off_y, _ = self._calculate_layout_dims(settings, crop_w, crop_h, None)
+        paper_w, paper_h, content_w, content_h, off_x, off_y, _ = self._calculate_layout_dims(settings, crop_w, crop_h, render_size_ref)
         full_source_res = np.empty((crop_h, crop_w, 3), dtype=np.float32)
 
         # Defect repairs are baked into the source before the engine, so no stage here
@@ -2480,7 +2652,7 @@ class GPUEngine:
         # textures/buffers live at once is the difference between fitting and a
         # device-lost abort. Left off, exports keep both the full tile size and the
         # overlap for throughput.
-        low_vram = APP_CONFIG.low_vram_export_tiling
+        low_vram = transient_tiles
         tile_size = TILE_SIZE_LOW_VRAM if low_vram else TILE_SIZE
 
         # The queue serializes tile N's staging copy ahead of tile N+1's passes, so
@@ -2519,9 +2691,10 @@ class GPUEngine:
                     camera_wb=camera_wb,
                     contrast_mask_override=global_mask,
                 )
-                handle = self._submit_readback(tile_res, slot=tile_index % 2)
+                handle = self._submit_readback(tile_res, slot=0 if low_vram else tile_index % 2)
                 if low_vram:
                     self._resolve_readback(handle, full_source_res[ty : ty + th, tx : tx + tw], (oy, ox))
+                    self._release_texture_pool()
                 else:
                     if pending is not None:
                         p_handle, p_ty, p_tx, p_th, p_tw, p_oy, p_ox = pending
@@ -2546,11 +2719,13 @@ class GPUEngine:
         # No border means the paper buffer is a full-res allocation, fill and copy that
         # reproduces the content exactly.
         if (paper_w, paper_h, off_x, off_y) == (content_w, content_h, 0, 0):
-            return scaled_content, metrics_ref
-        result = np.zeros((paper_h, paper_w, 3), dtype=np.float32)
-        color_hex = settings.finish.border_color.lstrip("#")
-        result[:] = tuple(int(color_hex[i : i + 2], 16) / 255.0 for i in (0, 2, 4))
-        result[off_y : off_y + content_h, off_x : off_x + content_w] = scaled_content
+            result = scaled_content
+        else:
+            result = np.zeros((paper_h, paper_w, 3), dtype=np.float32)
+            color_hex = settings.finish.border_color.lstrip("#")
+            result[:] = tuple(int(color_hex[i : i + 2], 16) / 255.0 for i in (0, 2, 4))
+            result[off_y : off_y + content_h, off_x : off_x + content_w] = scaled_content
+        metrics_ref["base_positive"] = result
         return result, metrics_ref
 
     def cleanup(self, collect: bool = True, retain: Optional[GPUTexture] = None) -> None:
@@ -2559,22 +2734,12 @@ class GPUEngine:
         ``retain`` is handed to the caller instead: its pool key goes with it, so the
         next render allocates a fresh one rather than painting over borrowed pixels.
         """
-        for tex in self._tex_cache.values():
-            if tex is not retain:
-                tex.destroy()
-        self._tex_cache.clear()
-        self._tex_gen.clear()
-        # Bind groups reference the destroyed views, so drop them.
-        self._bind_group_cache.clear()
+        self._release_texture_pool(retain)
         self._bind_layout_cache.clear()
         self._uv_grid_cache = None
         # The stage textures a resume would paint onto are gone, local_ev included, so the
         # next frame must re-upload and start from stage 0.
-        self._current_source_hash = None
-        self._last_settings = None
-        self._local_ev_key = None
         self._local_maps_cache = None
-        self._mask_tex_key = None
         if collect:
             gc.collect()
         logger.info("GPUEngine: VRAM resources released")

@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Optional
 
-from negpy.features.exposure.models import EXPOSURE_CONSTANTS
+from negpy.features.exposure.models import EXPOSURE_CONSTANTS, ExposureConfig
 
 
 class ProcessMode(StrEnum):
@@ -52,12 +52,37 @@ def cast_removal_for_mode(mode: str, strength: float) -> float:
     be the photograph. Only the other mode's default is rewritten, so a strength the user
     chose survives a mode switch.
     """
-    from negpy.features.exposure.models import ExposureConfig
-
     default = float(ExposureConfig.cast_removal_strength)
     if mode == ProcessMode.E6:
         return 0.0 if strength == default else strength
     return default if strength == 0.0 else strength
+
+
+def auto_meter_for_positive_source(positive_source: bool, current: bool) -> bool:
+    """The value Auto Density/Auto Grade's toggle carries after Positive is switched.
+
+    A negative starts metered (True): its exposure has no meaning until printed,
+    so a meter is what makes it printable at all. A finished positive starts
+    unmetered (False): reading it to decide a look is the opposite of trusting an
+    already-finished rendering decision, so it starts the way White/Black Point and
+    every other per-shot control already do -- neutral until touched. Only the other
+    setting's own default is rewritten, so a toggle the user chose survives the
+    switch (mirrors cast_removal_for_mode).
+    """
+    negative_default, positive_default = True, False
+    if positive_source:
+        return positive_default if current == negative_default else current
+    return negative_default if current == positive_default else current
+
+
+def mode_aware_exposure_reset(mode: str, base: ExposureConfig) -> ExposureConfig:
+    """`base` (typically the shipped default exposure section) with cast_removal_strength
+    replaced by its own mode-aware neutral point (cast_removal_for_mode) instead of the
+    flat value `base` always carries. Single source for every reset path that resets a
+    whole exposure section rather than one field at a time."""
+    from dataclasses import replace
+
+    return replace(base, cast_removal_strength=cast_removal_for_mode(mode, base.cast_removal_strength))
 
 
 # Built-in fallback crosstalk matrix (row-major 3x3) used when no profile is baked.
@@ -75,14 +100,19 @@ class ProcessConfig:
     # Correct narrowband RGB camera scans via the bundled RGBScan input profile
     # (applied at preview soft-proof / export; an explicit Input ICC overrides it).
     narrowband_scan: bool = False
-    # On the Transparency as-captured transfer the loader reads the source as literal linear
-    # data, for a raw capture whose camera matrix folds its own white balance back in. A
-    # finished positive decodes on its embedded profile instead (sRGB when untagged), and
-    # skips the baseline lift and filmic curve. See effective_linear_raw.
+    # The source is a finished positive (a scanned print, an export from other software, a
+    # scanner's own positive) rather than a raw capture. Slide only, held in __post_init__.
+    # It decodes on its embedded profile, sRGB when untagged, instead of as literal linear
+    # data, and skips metering, negative inversion, the baseline lift and the filmic curve.
+    # See effective_linear_raw and is_transfer_path.
     positive_source: bool = False
     # See loaders/helpers.get_best_demosaic_algorithm for what AUTO resolves to on each path.
     demosaic_preview: DemosaicMode = DemosaicMode.AUTO
     demosaic_export: DemosaicMode = DemosaicMode.AUTO
+    # libraw HighlightMode: 0=Clip (current behaviour), 2=Blend, 3-9=Reconstruct(level).
+    # 1 (Ignore) is reserved for a separate decode-correctness fix and is never valid here.
+    # Only meaningful on the positive path; see effective_highlight_reconstruction.
+    highlight_reconstruction: int = 0
     analysis_buffer: float = 0.05
     # Optional freehand analysis region, normalized in the transformed (display)
     # image, the same space as the manual crop rect. When set it is the exact area the
@@ -103,6 +133,11 @@ class ProcessConfig:
     locked_ceils: tuple[float, float, float] = (0.0, 0.0, 0.0)
     local_floors: tuple[float, float, float] = (0.0, 0.0, 0.0)
     local_ceils: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    # Roll/scene Cast Removal: the pooled neutral axis in raw log, in the meter's own shape
+    # (midtone, shadow, highlight or None, confidence) plus an offset weight
+    # (pool_neutral_axis). Color Negative only.
+    use_cast_average: bool = False
+    locked_neutral_axis: Optional[tuple] = None
 
     white_point_offset: float = 0.0
     black_point_offset: float = 0.0
@@ -140,6 +175,8 @@ class ProcessConfig:
     lock_bounds: bool = False
 
     roll_name: Optional[str] = None
+    # Where locked_floors/ceils came from: "roll:<roll id>", "scene:<scene id>" or "frame:<file name>".
+    baseline_source: str = ""
 
     def __post_init__(self) -> None:
         """
@@ -148,10 +185,16 @@ class ProcessConfig:
         # Not a MIGRATIONS entry: the old mode names also reach us from sticky settings
         # and asset dicts, not only a loaded flat config, so this runs on every build.
         object.__setattr__(self, "process_mode", ProcessMode(self.process_mode))
+        # Slide-only, and every path into a config -- saved row, sticky settings, roll
+        # default, asset dict -- has to land where the panel does.
+        if self.positive_source and self.process_mode != ProcessMode.E6:
+            object.__setattr__(self, "positive_source", False)
         object.__setattr__(self, "locked_floors", tuple(self.locked_floors))
         object.__setattr__(self, "locked_ceils", tuple(self.locked_ceils))
         object.__setattr__(self, "local_floors", tuple(self.local_floors))
         object.__setattr__(self, "local_ceils", tuple(self.local_ceils))
+        if self.locked_neutral_axis is not None:
+            object.__setattr__(self, "locked_neutral_axis", neutral_axis_tuple(self.locked_neutral_axis))
         if self.crosstalk_matrix is not None:
             object.__setattr__(self, "crosstalk_matrix", tuple(self.crosstalk_matrix))
         if self.sensor_matrix is not None:
@@ -168,6 +211,20 @@ class ProcessConfig:
     def is_locked_initialized(self) -> bool:
         """Checks if a roll-wide baseline is available."""
         return any(v != 0.0 for v in self.locked_floors)
+
+
+def neutral_axis_tuple(axis) -> tuple:
+    """A neutral axis read back from JSON as nested tuples; a pooled one carries a fifth
+    element, its offset weight."""
+    mid, shadow, highlight, *scalars = axis
+    return (tuple(mid), tuple(shadow), tuple(highlight) if highlight is not None else None, *(float(v) for v in scalars))
+
+
+def pooled_neutral_axis(process: ProcessConfig) -> Optional[tuple]:
+    """The roll/scene neutral axis this frame renders Cast Removal with, or None to meter its own."""
+    if process.use_cast_average and process.process_mode == ProcessMode.C41:
+        return process.locked_neutral_axis
+    return None
 
 
 def invalidate_local_bounds(process: ProcessConfig) -> dict:

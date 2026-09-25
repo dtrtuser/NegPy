@@ -9,7 +9,7 @@ from negpy.desktop.session import ToolMode, AppState
 from negpy.desktop.view.canvas.gpu_widget import GPUCanvasWidget
 from negpy.desktop.view.canvas.hud import CanvasHud
 from negpy.desktop.view.canvas.overlay import CanvasOverlay
-from negpy.desktop.view.widgets.granular_settings_dialog import open_paste_dialog
+from negpy.desktop.view.widgets.granular_settings_dialog import open_paste_dialog, open_sync_bounds_dialog
 from negpy.infrastructure.gpu.device import GPUDevice
 from negpy.infrastructure.gpu.resources import GPUTexture
 from negpy.desktop.view.shortcut_registry import label_with_shortcut
@@ -36,6 +36,8 @@ def clamp_canvas_zoom_level(zoom: float) -> float:
 WHEEL_ZOOM_NOTCH = 1.1
 # Trackpad: map pixel delta to notch-equivalents (tuned for ~smooth steps).
 _WHEEL_PIXELS_PER_NOTCH = 64.0
+# How much of a pinch is one pixel of brush diameter, as a log scale ratio.
+_PINCH_BRUSH_STEP = 0.06
 
 _TOOL_CURSORS: dict[ToolMode, Qt.CursorShape] = {
     ToolMode.NONE: Qt.CursorShape.ArrowCursor,
@@ -118,6 +120,7 @@ class ImageCanvas(QWidget):
     cursor_left_canvas = pyqtSignal()
     local_mask_created = pyqtSignal(str, list)
     scratch_completed = pyqtSignal(list)
+    dust_exclusion_painted = pyqtSignal(list)
     straighten_completed = pyqtSignal(float)
     test_strip_picked = pyqtSignal(int, int)
     zone_pin_moved = pyqtSignal(int, float, float, bool)
@@ -130,6 +133,8 @@ class ImageCanvas(QWidget):
         super().__init__(parent)
         self.state = state
         self._controller: Optional["AppController"] = None
+        # Carries the sub-pixel remainder of a pinch between its update events.
+        self._pinch_accum = 0.0
         self.setMouseTracking(True)
 
         if sys.platform == "win32":
@@ -175,6 +180,7 @@ class ImageCanvas(QWidget):
         self.overlay.cursor_left.connect(self.cursor_left_canvas.emit)
         self.overlay.local_mask_created.connect(self.local_mask_created.emit)
         self.overlay.scratch_completed.connect(self.scratch_completed.emit)
+        self.overlay.dust_exclusion_painted.connect(self.dust_exclusion_painted.emit)
         self.overlay.straighten_completed.connect(self.straighten_completed.emit)
         self.overlay.test_strip_picked.connect(self.test_strip_picked.emit)
         self.overlay.zone_pin_moved.connect(self.zone_pin_moved.emit)
@@ -474,6 +480,28 @@ class ImageCanvas(QWidget):
                 return True
         return super().event(e)
 
+    def _pinch_sizes_brush(self) -> bool:
+        """A live brush takes the pinch. The wheel still zooms in that state, so no context
+        is left without a zoom route."""
+        if self.state.active_tool in (ToolMode.DUST_PICK, ToolMode.SCRATCH_PICK):
+            return True
+        return bool(self.state.config.retouch.dust_remove and self.state.right_click_excludes)
+
+    def _pinch_brush_step(self, k: float) -> None:
+        """A pinch reports a scale factor per event; hold the fraction back until it is worth
+        a whole pixel of diameter, or a slow pinch would never move the brush."""
+        if not math.isfinite(k) or k <= 0.0:
+            return
+        self._pinch_accum += math.log(k) / _PINCH_BRUSH_STEP
+        steps = int(self._pinch_accum)
+        if steps:
+            self._pinch_accum -= steps
+            self._adjust_brush_size(float(steps))
+
+    def _adjust_brush_size(self, notches: float) -> None:
+        if self._controller is not None:
+            self._controller.adjust_brush_size(notches)
+
     def _try_pinch_gesture(self, ev: QGestureEvent) -> bool:
         g = ev.gesture(Qt.GestureType.PinchGesture)
         if g is None or not isinstance(g, QPinchGesture):
@@ -483,12 +511,17 @@ class ImageCanvas(QWidget):
             ev.setAccepted(g, True)
             return True
         if st == Qt.GestureState.GestureStarted:
+            self._pinch_accum = 0.0
             ev.setAccepted(g, True)
             return True
         if st != Qt.GestureState.GestureUpdated:
             return False
         k = float(g.lastScaleFactor())
         if not math.isfinite(k) or k <= 0.0 or abs(k - 1.0) < 1e-6:
+            ev.setAccepted(g, True)
+            return True
+        if self._pinch_sizes_brush():
+            self._pinch_brush_step(k)
             ev.setAccepted(g, True)
             return True
         anchor = g.centerPoint()
@@ -505,6 +538,7 @@ class ImageCanvas(QWidget):
         if n.gestureType() != Qt.NativeGestureType.ZoomNativeGesture:
             return False
         if n.isBeginEvent() or n.isEndEvent():
+            self._pinch_accum = 0.0
             n.accept()
             return True
         n.accept()
@@ -512,7 +546,10 @@ class ImageCanvas(QWidget):
             return True
         k = self._scale_from_native_zoom_value(n.value())
         if k is not None and abs(k - 1.0) >= 1e-6:
-            self._apply_scale_at(k, n.position())
+            if self._pinch_sizes_brush():
+                self._pinch_brush_step(k)
+            else:
+                self._apply_scale_at(k, n.position())
         return True
 
     def wheelEvent(self, event: QWheelEvent) -> None:
@@ -525,6 +562,14 @@ class ImageCanvas(QWidget):
         # User preference: reverse scroll-to-zoom direction (set in Customize Shortcuts).
         if getattr(self.state, "invert_zoom_scroll", False):
             u = -u
+
+        # Alt is the brush-size modifier the keyboard already uses (Alt+M), so it sizes the
+        # brush here too and the plain wheel keeps zooming everywhere. Downstream of the
+        # inversion, so one scroll direction means "more" for both.
+        if event.modifiers() & Qt.KeyboardModifier.AltModifier:
+            self._adjust_brush_size(u)
+            event.accept()
+            return
 
         zmin = APP_CONFIG.canvas_zoom_min
         zmax = APP_CONFIG.canvas_zoom_max
@@ -631,19 +676,22 @@ class ImageCanvas(QWidget):
         self.overlay.update_overlay(filename, res, colorspace, extra, edits)
 
     def contextMenuEvent(self, event) -> None:
+        self.show_canvas_menu(QPointF(event.pos()), event.globalPos())
+
+    def show_canvas_menu(self, pos: QPointF, global_pos) -> None:
+        """The canvas menu at ``pos`` (widget coordinates). Also called by the overlay, which
+        holds the menu back until a right press turns out not to be an exclusion drag."""
         if self.state.selected_file_idx < 0 or self._controller is None:
-            event.ignore()
             return
 
         # While a heal tool is live the menu serves that tool: the general settings menu would
         # be noise mid-retouch.
         if self.state.active_tool in (ToolMode.DUST_PICK, ToolMode.SCRATCH_PICK):
-            self._exec_retouch_menu(event)
+            self._exec_retouch_menu(pos, global_pos)
             return
 
         # Right-click on a selected mask's vertex deletes that point (no menu).
-        if self.state.active_tool in (ToolMode.NONE, ToolMode.LOCAL_DRAW) and self.overlay.try_delete_local_vertex(QPointF(event.pos())):
-            event.accept()
+        if self.state.active_tool in (ToolMode.NONE, ToolMode.LOCAL_DRAW) and self.overlay.try_delete_local_vertex(pos):
             return
 
         menu = QMenu(self)
@@ -651,6 +699,7 @@ class ImageCanvas(QWidget):
         act_wb.triggered.connect(lambda: self._controller.set_active_tool(ToolMode.WB_PICK))  # type: ignore[union-attr]
         act_dust = menu.addAction(label_with_shortcut("Pick Dust", "pick_dust"))
         act_dust.triggered.connect(lambda: self._controller.set_active_tool(ToolMode.DUST_PICK))  # type: ignore[union-attr]
+        self._add_exclude_action(menu, pos)
         menu.addSeparator()
         act_copy = menu.addAction(label_with_shortcut("Copy Settings", "copy"))
         act_copy.triggered.connect(self._controller.session.copy_settings)  # type: ignore[union-attr]
@@ -659,6 +708,8 @@ class ImageCanvas(QWidget):
         act_paste = menu.addAction(label_with_shortcut("Paste Settings", "paste"))
         act_paste.triggered.connect(lambda: open_paste_dialog(self, self._controller))  # type: ignore[arg-type]
         act_paste.setEnabled(self.state.clipboard is not None)
+        act_sync_bounds = menu.addAction(label_with_shortcut("Sync Bounds…", "sync_bounds"))
+        act_sync_bounds.triggered.connect(lambda: open_sync_bounds_dialog(self, self._controller.session))  # type: ignore[union-attr]
         menu.addSeparator()
         act_reset = menu.addAction("Reset View")
         act_reset.triggered.connect(self.fit_to_window)
@@ -669,7 +720,18 @@ class ImageCanvas(QWidget):
         menu.addSeparator()
         act_unload = menu.addAction("Unload…")
         act_unload.triggered.connect(self._unload_current_file)
-        menu.exec(event.globalPos())
+        menu.exec(global_pos)
+
+    def _add_exclude_action(self, menu: QMenu, pos: QPointF) -> None:
+        """Adds the exclude item for the patch under the cursor, on the menus a right-click
+        reaches while the detector is running."""
+        if not self.state.config.retouch.dust_remove or self._controller is None:
+            return
+        coords = self.overlay.image_coords_at(pos)
+        if coords is None:
+            return
+        act = menu.addAction("Exclude From Optical Removal")
+        act.triggered.connect(lambda _=False, c=coords: self._controller.handle_dust_exclusion_painted([c]))  # type: ignore[union-attr]
 
     def _unload_current_file(self) -> None:
         """Removes the current image from the session (its saved edit is kept)."""
@@ -680,13 +742,12 @@ class ImageCanvas(QWidget):
         if confirm_unload(self):
             self._controller.session.remove_current_file()
 
-    def _exec_retouch_menu(self, event) -> None:
+    def _exec_retouch_menu(self, pos: QPointF, global_pos) -> None:
         """Context menu while the heal or scratch tool is active."""
         controller = self._controller
         assert controller is not None
         conf = self.state.config.retouch
         num_heals = len(conf.manual_dust_spots) + len(conf.manual_heal_strokes)
-        pos = QPointF(event.pos())
 
         menu = QMenu(self)
 
@@ -706,10 +767,11 @@ class ImageCanvas(QWidget):
             act_delete.triggered.connect(lambda _=False, k=kind, i=index: controller.delete_heal(k, i))
             menu.addSeparator()
 
+        self._add_exclude_action(menu, pos)
         act_undo = menu.addAction(label_with_shortcut("Undo Last Heal", "undo"))
         act_undo.triggered.connect(controller.undo_last_retouch)
         act_undo.setEnabled(num_heals > 0)
         act_clear = menu.addAction("Clear All Heals…")
         act_clear.triggered.connect(controller.clear_retouch)
         act_clear.setEnabled(num_heals > 0)
-        menu.exec(event.globalPos())
+        menu.exec(global_pos)

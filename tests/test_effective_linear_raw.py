@@ -111,12 +111,25 @@ class TestShouldFoldCameraWb:
 
     def test_never_folds_for_narrowband_even_though_the_decode_is_neutral(self):
         assert not should_fold_camera_wb(replace(cfg(ProcessMode.C41, linear_raw=True), narrowband_scan=True))
-        assert not should_fold_camera_wb(replace(cfg(ProcessMode.E6, normalize=False), narrowband_scan=True))
+
+    def test_a_narrowband_flag_left_on_from_a_negative_still_folds_on_a_slide(self):
+        """The flag is remembered across a mode switch and greyed out on a slide, where no
+        narrowband correction applies (narrowband_profile_active). Skipping the fold there
+        renders the slide unbalanced, the same tint the fold exists to prevent."""
+        assert should_fold_camera_wb(replace(cfg(ProcessMode.E6, normalize=False), narrowband_scan=True))
 
     def test_narrowband_does_not_matter_when_the_decode_already_carries_wb(self):
         """Nothing to un-fold: the decode applied WB itself, so the matrix must stay out
         of it regardless of the light — same as the non-narrowband case."""
         assert not should_fold_camera_wb(replace(cfg(ProcessMode.C41, linear_raw=False), narrowband_scan=True))
+
+    def test_never_folds_when_reconstruction_bakes_white_balance_in(self):
+        """An active reconstruction on the transfer path bakes real white balance into the
+        decode itself (see highlight_reconstruction_bakes_wb); folding it again here would
+        double-apply it, even though effective_linear_raw alone still reads True."""
+        transfer_with_reconstruction = replace(cfg(ProcessMode.E6, normalize=False, linear_raw=False), highlight_reconstruction=5)
+        assert effective_linear_raw(transfer_with_reconstruction)
+        assert not should_fold_camera_wb(transfer_with_reconstruction)
 
 
 class TestDecodeAndMatrixAgree:
@@ -152,7 +165,7 @@ class TestDecodeAndMatrixAgree:
         from negpy.desktop.workers import render
 
         src = inspect.getsource(render)
-        assert "params.process.linear_raw if params else" not in src, "Batch Analysis is back on the stored flag"
+        assert "params.process.linear_raw if params else" not in src, "Roll Analysis is back on the stored flag"
         assert "effective_linear_raw" in src
 
     def test_neighbour_prefetch_keys_on_the_same_decode(self):

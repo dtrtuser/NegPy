@@ -381,7 +381,7 @@ def test_nothing_matched_message_offers_to_turn_the_mode_off():
     from negpy.desktop.workers.render import rgb_nothing_matched_message
 
     title, body = rgb_nothing_matched_message({"loose": 36, "narrowband": False, "by_time": True})
-    assert "Turn Trichrome Scan off" in body
+    assert "Turn Trichrome Mode off" in body
     assert "one frame at a time" not in body
     assert title == "Nothing to assemble"
 
@@ -436,7 +436,7 @@ def test_grouping_notice_reports_the_filename_fallback():
 def test_grouping_notice_omits_the_count_when_nothing_assembled():
     from negpy.desktop.workers.render import rgb_grouping_notice
 
-    assert rgb_grouping_notice(0, 6, 2, 0, True).startswith("Trichrome Scan: 6 files left separate")
+    assert rgb_grouping_notice(0, 6, 2, 0, True).startswith("Trichrome Mode: 6 files left separate")
 
 
 def test_group_triplets_flags_bad_chunks():
@@ -775,7 +775,7 @@ def test_thumbnail_worker_namespaces_triplet_cache(monkeypatch):
             saved[key] = img
 
     img = Image.new("RGB", (4, 4))
-    monkeypatch.setattr(thumbnails, "decode_source_image", lambda *a, **k: img)
+    monkeypatch.setattr(thumbnails, "decode_bounded_source_preview", lambda *a, **k: img)
     monkeypatch.setattr(thumbnails, "prepare_thumbnail", lambda i, ts: i)
 
     store = Store()
@@ -804,7 +804,7 @@ def test_triplet_ignores_stale_plain_hash_cache(monkeypatch):
         def save_thumbnail(self, key, img):
             saved[key] = img
 
-    monkeypatch.setattr(thumbnails, "decode_source_image", lambda *a, **k: merged)
+    monkeypatch.setattr(thumbnails, "decode_bounded_source_preview", lambda *a, **k: merged)
     monkeypatch.setattr(thumbnails, "prepare_thumbnail", lambda i, ts: i)
 
     # The worker inverts the decoded negative, so identity is not the check — provenance is.

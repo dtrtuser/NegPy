@@ -5,7 +5,7 @@ from dataclasses import replace
 
 from negpy.features.exposure.models import ExposureConfig
 from negpy.features.finish.models import FinishConfig
-from negpy.features.local.models import LocalAdjustmentsConfig, LocalMask
+from negpy.features.local.models import LocalAdjustmentsConfig, LocalMask, MaskKey
 from negpy.services.view.printing_notes import mask_notes, recipe_lines, stops_label
 
 SQUARE = ((0.2, 0.2), (0.8, 0.2), (0.8, 0.8), (0.2, 0.8))
@@ -116,6 +116,22 @@ def test_masks_at_the_frame_grade_carry_no_grade_note() -> None:
     assert note.summary == "1 Burn +1"
 
 
+def test_a_disabled_mask_carries_no_note_but_keeps_its_neighbours_number() -> None:
+    """A disabled mask does not print, so it is left off the record; the mask after it
+    keeps the number matching its position in the mask list."""
+    local = LocalAdjustmentsConfig(
+        masks=(
+            replace(LocalMask(vertices=SQUARE, stops=1.0), enabled=False),
+            LocalMask(vertices=SQUARE, stops=-0.25),
+        )
+    )
+    (note,) = mask_notes(local)
+    assert note.number == 2
+
+    lines = recipe_lines(ExposureConfig(), local, FinishConfig())
+    assert "Dodge & burn: 2 Dodge −¼" in "\n".join(lines)
+
+
 def test_the_record_names_each_mask_grade() -> None:
     local = LocalAdjustmentsConfig(
         masks=(
@@ -126,3 +142,19 @@ def test_the_record_names_each_mask_grade() -> None:
     lines = recipe_lines(replace(ExposureConfig(), grade=115.0), local, FinishConfig())
 
     assert "Dodge & burn: 1 Burn +1 @ R95 · 2 Dodge −¼" in "\n".join(lines)
+
+
+def test_a_tone_limited_mask_names_its_zone() -> None:
+    local = LocalAdjustmentsConfig(masks=(LocalMask(vertices=SQUARE, stops=1.0, key=MaskKey.HIGHLIGHTS, key_zone=6.0),))
+    (note,) = mask_notes(local)
+
+    assert note.badge == "1 +1 ≥VI"
+    assert note.summary == "1 Burn +1 on ≥VI"
+
+
+def test_a_shadow_limit_reads_at_or_below_its_zone() -> None:
+    local = LocalAdjustmentsConfig(masks=(LocalMask(vertices=SQUARE, stops=-0.5, grade=-20.0, key=MaskKey.SHADOWS, key_zone=10.0 / 3.0),))
+    (note,) = mask_notes(local, grade=115.0)
+
+    assert note.badge == "1 −½ R95 ≤III⅓"
+    assert note.summary == "1 Dodge −½ @ R95 on ≤III⅓"
